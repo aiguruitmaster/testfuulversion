@@ -6,26 +6,23 @@ from openpyxl import load_workbook
 import time
 import requests
 from urllib.parse import urlparse, urlunparse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # -----------------------
-# Конфигурация и API настройки
+# Конфигурация и API
 # -----------------------
 st.set_page_config(page_title="SEO Index Manager", layout="wide")
 
-# DataForSEO Constants
 TASK_POST = "/v3/serp/google/organic/task_post"
 TASKS_READY = "/v3/serp/google/organic/tasks_ready"
 TASK_GET_ADV = "/v3/serp/google/organic/task_get/advanced/{task_id}"
 
-# Подключение к Supabase
 @st.cache_resource
 def init_supabase():
     url = st.secrets["supabase"]["url"]
     key = st.secrets["supabase"]["key"]
     return create_client(url, key)
 
-# Подключение сессии для DataForSEO
 def init_requests():
     s = requests.Session()
     s.auth = (st.secrets["dataforseo"]["login"], st.secrets["dataforseo"]["password"])
@@ -39,36 +36,28 @@ except Exception as e:
     st.stop()
 
 # -----------------------
-# Хелперы (из твоего старого скрипта)
+# Хелперы
 # -----------------------
 def norm_url(u: str) -> str:
-    """Нормализация URL для сравнения"""
     p = urlparse(u.strip())
     netloc = (p.netloc or "").lower()
-    if netloc.startswith("www."):
-        netloc = netloc[4:]
+    if netloc.startswith("www."): netloc = netloc[4:]
     path = (p.path or "").rstrip("/")
     return urlunparse(("", netloc, path, "", "", "")).lower()
 
 def build_site_query(url: str) -> str:
-    """Создает запрос site:url"""
     p = urlparse(url.strip())
     host = (p.netloc or "").lower()
-    if host.startswith("www."):
-        host = host[4:]
+    if host.startswith("www."): host = host[4:]
     path = (p.path or "").strip().lstrip("/").rstrip("/")
-    if path in ("", "/"):
-        return f"site:{host}"
-    return f"site:{host}/{path}"
+    return f"site:{host}" if path in ("", "/") else f"site:{host}/{path}"
 
 def match_indexed(original_url: str, items):
-    """Проверяет, есть ли URL в выдаче"""
     orig = norm_url(original_url)
     for it in items:
         if it.get("type") == "organic":
             u = it.get("url")
-            if u and norm_url(u) == orig:
-                return True
+            if u and norm_url(u) == orig: return True
     return False
 
 def parse_excel_urls(uploaded_file):
@@ -88,12 +77,15 @@ def parse_excel_urls(uploaded_file):
     return urls
 
 # -----------------------
-# Логика проверки (Core Engine)
+# Логика массовой проверки
 # -----------------------
-def run_check(project_id, links_data):
+def run_check(links_data):
     """
-    Принимает список словарей links_data [{'id': 1, 'url': '...'}, ...]
+    Принимает список словарей [{'id': 1, 'url': '...'}, ...]
+    Может принимать ссылки из разных проектов сразу.
     """
+    if not links_data: return
+    
     session = init_requests()
     host = st.secrets["dataforseo"].get("host", "api.dataforseo.com").replace("https://", "")
     base_url = f"https://{host}"
@@ -101,28 +93,18 @@ def run_check(project_id, links_data):
     progress_bar = st.progress(0.0)
     status_text = st.empty()
     
-    # 1. Формируем задачи (POST)
-    tasks_map = {} # task_id -> link_db_id
     payload = []
+    tasks_map = {} 
     
-    # DataForSEO настройки
-    post_body_base = {
-        "location_code": 2840,
-        "language_code": "en",
-        "depth": 10
-    }
-
+    # Подготовка Payload
     for item in links_data:
-        p = post_body_base.copy()
-        p["keyword"] = build_site_query(item['url'])
-        # Используем pingback_url или просто tag, чтобы связать задачу. 
-        # Но проще через порядок, так как API возвращает в том же порядке.
-        # Для надежности будем мапить по порядку, но осторожно.
-        payload.append(p)
+        payload.append({
+            "location_code": 2840,
+            "language_code": "en",
+            "depth": 10,
+            "keyword": build_site_query(item['url'])
+        })
 
-    # Разбиваем на батчи по 100, если нужно, но для простоты пока одним куском (до 100 шт)
-    # Если ссылок > 100, лучше добавить цикл батчинга. Добавим простой батчинг.
-    
     BATCH_SIZE = 50
     total = len(links_data)
     processed_count = 0
@@ -131,178 +113,237 @@ def run_check(project_id, links_data):
         batch_links = links_data[i : i + BATCH_SIZE]
         batch_payload = payload[i : i + BATCH_SIZE]
         
-        status_text.write(f"📤 Отправка задач {i+1}-{min(i+BATCH_SIZE, total)} из {total}...")
+        status_text.write(f"📤 Обработка {i+1}-{min(i+BATCH_SIZE, total)} из {total}...")
         
         try:
             r = session.post(base_url + TASK_POST, json=batch_payload, timeout=60)
             res = r.json()
-            if res.get('status_code') != 20000:
+            
+            if res.get('status_code') == 20000:
+                batch_task_ids = []
+                for idx, task in enumerate(res.get('tasks', [])):
+                    if task.get('id'):
+                        tid = task['id']
+                        link_db_id = batch_links[idx]['id']
+                        tasks_map[tid] = link_db_id
+                        batch_task_ids.append(tid)
+                
+                if not batch_task_ids: continue
+
+                # Ожидание
+                time.sleep(2) # Небольшая пауза перед поллингом
+                status_text.write("⏳ Анализ результатов...")
+                
+                # Получение результатов (поштучно для надежности)
+                for tid in batch_task_ids:
+                    try:
+                        r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
+                        d_get = r_get.json()
+                        
+                        link_id = tasks_map[tid]
+                        original_link_obj = next(l for l in batch_links if l['id'] == link_id)
+                        
+                        task_res = (d_get.get('tasks') or [{}])[0]
+                        if task_res.get('status_code') == 20000:
+                            result_items = (task_res.get('result') or [{}])[0].get('items', [])
+                            is_ind = match_indexed(original_link_obj['url'], result_items)
+                            
+                            supabase.table("links").update({
+                                "status": "done",
+                                "is_indexed": is_ind,
+                                "last_check": datetime.utcnow().isoformat(),
+                                "task_id": tid
+                            }).eq("id", link_id).execute()
+                        else:
+                            supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
+                            
+                    except Exception as e:
+                        print(f"Err task {tid}: {e}")
+            else:
                 st.error(f"API Error: {res.get('status_message')}")
-                continue
-                
-            # Собираем ID задач
-            batch_task_ids = []
-            for idx, task in enumerate(res.get('tasks', [])):
-                if task.get('id'):
-                    tid = task['id']
-                    # Связываем task_id с ID ссылки в нашей базе
-                    link_db_id = batch_links[idx]['id']
-                    tasks_map[tid] = link_db_id
-                    batch_task_ids.append(tid)
-                    
-                    # (Опционально) Можно сразу записать task_id в базу, чтобы не потерять
-            
-            # 2. Ждем выполнения
-            if not batch_task_ids:
-                continue
-                
-            status_text.write("⏳ Ожидание результатов от Google...")
-            # Простое ожидание (polling)
-            completed_tasks = set()
-            attempts = 0
-            while len(completed_tasks) < len(batch_task_ids) and attempts < 20:
-                time.sleep(3) 
-                attempts += 1
-                # Проверяем готовность (упрощенно - сразу пробуем GET, так как task_post organic обычно быстр, 
-                # но правильнее через tasks_ready. Для упрощения кода используем GET, он вернет 'status': 'working' если не готов)
-                # Лучше все же tasks_ready для батча, но для 50 штук можно и в лоб.
-                pass 
-            
-            # 3. Получаем результаты по каждой задаче
-            for tid in batch_task_ids:
-                # Получаем результат
-                r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
-                try:
-                    d_get = r_get.json()
-                    # Проверяем, готова ли задача
-                    task_res = (d_get.get('tasks') or [{}])[0]
-                    
-                    link_id = tasks_map[tid]
-                    original_link_obj = next(l for l in batch_links if l['id'] == link_id)
-                    
-                    if task_res.get('status_code') == 20000:
-                        result_items = (task_res.get('result') or [{}])[0].get('items', [])
-                        is_ind = match_indexed(original_link_obj['url'], result_items)
-                        
-                        # ОБНОВЛЯЕМ БАЗУ
-                        supabase.table("links").update({
-                            "status": "done",
-                            "is_indexed": is_ind,
-                            "last_check": datetime.utcnow().isoformat(),
-                            "task_id": tid
-                        }).eq("id", link_id).execute()
-                        
-                    else:
-                        # Ошибка или еще работает
-                        supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
-                        
-                except Exception as e:
-                    print(f"Error parsing result: {e}")
-        
+
             processed_count += len(batch_links)
             progress_bar.progress(processed_count / total)
             
         except Exception as e:
-            st.error(f"Сбой сети или API: {e}")
+            st.error(f"Network error: {e}")
 
-    status_text.success("✅ Проверка завершена!")
-    time.sleep(2)
+    status_text.success("✅ Готово!")
+    time.sleep(1)
     st.rerun()
-
 
 # -----------------------
 # Сайдбар
 # -----------------------
 with st.sidebar:
-    st.title("🗂 Мои Проекты")
+    st.title("🗂 Меню")
     
-    with st.expander("➕ Создать новую папку"):
-        new_proj = st.text_input("Название папки")
+    if st.button("🏠 На главную (Дашборд)"):
+        st.session_state.selected_project_id = None
+        st.rerun()
+    
+    st.divider()
+    
+    st.subheader("Мои Проекты")
+    # Создание
+    with st.expander("➕ Новый проект"):
+        new_proj = st.text_input("Название")
         if st.button("Создать"):
             if new_proj:
                 supabase.table("projects").insert({"name": new_proj}).execute()
                 st.rerun()
 
-    st.divider()
-
+    # Список проектов
     response = supabase.table("projects").select("*").order("created_at", desc=True).execute()
     projects = response.data
     
-    selected_project_id = None
+    # Используем session_state для хранения выбранного проекта
+    if "selected_project_id" not in st.session_state:
+        st.session_state.selected_project_id = None
+
     if projects:
-        opts = {p['name']: p['id'] for p in projects}
-        p_name = st.selectbox("Активная папка:", list(opts.keys()))
-        selected_project_id = opts[p_name]
+        for p in projects:
+            # Делаем кнопки вместо selectbox для удобства
+            if st.button(f"📂 {p['name']}", key=p['id'], use_container_width=True):
+                st.session_state.selected_project_id = p['id']
+                st.rerun()
 
 # -----------------------
-# Основной экран
+# ЛОГИКА ЭКРАНОВ
 # -----------------------
-if selected_project_id:
-    st.title(f"📂 {p_name}")
+
+# 1. ЭКРАН ПРОЕКТА (если выбран)
+if st.session_state.selected_project_id:
+    # Ищем имя проекта
+    current_proj = next((p for p in projects if p['id'] == st.session_state.selected_project_id), None)
+    if not current_proj:
+        st.session_state.selected_project_id = None
+        st.rerun()
+        
+    st.title(f"📂 Проект: {current_proj['name']}")
     
-    # Грузим данные
-    res = supabase.table("links").select("*").eq("project_id", selected_project_id).order("id", desc=False).execute()
+    # Грузим ссылки
+    res = supabase.table("links").select("*").eq("project_id", st.session_state.selected_project_id).order("id", desc=False).execute()
     df = pd.DataFrame(res.data)
 
-    # Статистика
     if not df.empty:
         total = len(df)
         indexed = len(df[df['is_indexed'] == True])
         pending = len(df[df['status'] == 'pending'])
         
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Всего ссылок", total)
-        c2.metric("В индексе", indexed)
+        # Метрики
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Всего", total)
+        c2.metric("В индексе", f"{indexed} ({(indexed/total*100):.1f}%)")
         c3.metric("Очередь", pending)
         
+        # Кнопки действий
+        with c4:
+            if pending > 0:
+                if st.button("🚀 Проверить очередь", type="primary"):
+                    to_check = df[df['status'] == 'pending'][['id', 'url']].to_dict('records')
+                    run_check(to_check)
+            else:
+                if st.button("🔄 Сбросить и проверить заново"):
+                    supabase.table("links").update({"status": "pending", "is_indexed": None}).eq("project_id", st.session_state.selected_project_id).execute()
+                    st.rerun()
+                    
+        # Таблица
         st.divider()
-        
-        # КНОПКА ЗАПУСКА ПРОВЕРКИ
-        # Показываем, только если есть что проверять (pending > 0)
-        if pending > 0:
-            if st.button(f"🚀 Запустить проверку ({pending} шт.)", type="primary"):
-                # Выбираем только pending ссылки для обработки
-                links_to_check = df[df['status'] == 'pending'][['id', 'url']].to_dict('records')
-                run_check(selected_project_id, links_to_check)
-        else:
-            if st.button("🔄 Перепроверить всё (Сбросить статусы)"):
-                # Сброс статусов на pending
-                supabase.table("links").update({
-                    "status": "pending", 
-                    "is_indexed": None
-                }).eq("project_id", selected_project_id).execute()
-                st.rerun()
-
-    # Загрузка
-    with st.expander("📥 Добавить ссылки", expanded=(df.empty)):
-        uploaded = st.file_uploader("Excel (колонка B)", type=["xlsx"])
-        if uploaded and st.button("💾 Сохранить"):
-            urls = parse_excel_urls(uploaded)
-            if urls:
-                data = [{"project_id": selected_project_id, "url": u, "status": "pending"} for u in urls]
-                # Batch insert
-                batch_size = 1000
-                bar = st.progress(0)
-                for i in range(0, len(data), batch_size):
-                    supabase.table("links").insert(data[i:i+batch_size]).execute()
-                    bar.progress(min((i+batch_size)/len(data), 1.0))
-                st.success(f"Добавлено {len(urls)} ссылок")
-                time.sleep(1)
-                st.rerun()
-
-    # Таблица
-    st.subheader("Список ссылок")
-    if not df.empty:
         st.dataframe(
             df[['url', 'status', 'is_indexed', 'last_check', 'created_at']], 
             use_container_width=True,
             column_config={
                 "is_indexed": st.column_config.CheckboxColumn("Index?", disabled=True),
-                "url": st.column_config.LinkColumn("URL")
+                "url": st.column_config.LinkColumn("URL"),
+                "last_check": st.column_config.DatetimeColumn("Дата проверки", format="D MMM YYYY, HH:mm")
             }
         )
     else:
-        st.info("Нет данных.")
+        st.info("В папке пусто.")
+    
+    # Загрузка
+    with st.expander("📥 Добавить Excel файл", expanded=(df.empty)):
+        uploaded = st.file_uploader("Загрузить ссылки (колонка B)", type=["xlsx"])
+        if uploaded and st.button("Сохранить в базу"):
+            urls = parse_excel_urls(uploaded)
+            if urls:
+                data = [{"project_id": st.session_state.selected_project_id, "url": u, "status": "pending"} for u in urls]
+                batch_size = 1000
+                bar = st.progress(0)
+                for i in range(0, len(data), batch_size):
+                    supabase.table("links").insert(data[i:i+batch_size]).execute()
+                    bar.progress(min((i+batch_size)/len(data), 1.0))
+                st.success(f"Добавлено {len(urls)}")
+                time.sleep(1)
+                st.rerun()
 
+# 2. ГЛАВНЫЙ ДАШБОРД (если проект не выбран)
 else:
-    st.write("Выберите проект.")
+    st.title("📊 Дашборд мониторинга")
+    
+    # Получаем ВСЕ ссылки сразу, чтобы посчитать статистику
+    # В идеале это делать через RPC на стороне базы, но для тысяч строк Python справится
+    all_links_res = supabase.table("links").select("id, project_id, status, is_indexed, last_check, url").execute()
+    all_links_df = pd.DataFrame(all_links_res.data)
+    
+    if projects:
+        stats_data = []
+        global_pending_count = 0
+        
+        for p in projects:
+            pid = p['id']
+            if not all_links_df.empty:
+                p_links = all_links_df[all_links_df['project_id'] == pid]
+                total = len(p_links)
+                idx = len(p_links[p_links['is_indexed'] == True])
+                pend = len(p_links[p_links['status'] == 'pending'])
+                
+                # Ищем самую свежую дату проверки
+                last_date = None
+                if not p_links['last_check'].isna().all():
+                    last_date = pd.to_datetime(p_links['last_check']).max()
+            else:
+                total, idx, pend, last_date = 0, 0, 0, None
+                
+            global_pending_count += pend
+            
+            stats_data.append({
+                "ID": pid,
+                "Проект": p['name'],
+                "Всего ссылок": total,
+                "В индексе": idx,
+                "% Index": f"{(idx/total*100):.1f}%" if total > 0 else "0%",
+                "Очередь": pend,
+                "Последняя проверка": last_date
+            })
+            
+        stats_df = pd.DataFrame(stats_data)
+        
+        # Метрики дашборда
+        m1, m2 = st.columns([3, 1])
+        m1.metric("Всего проектов", len(projects))
+        m2.metric("Всего задач в очереди", global_pending_count)
+        
+        # ГЛОБАЛЬНАЯ КНОПКА ЗАПУСКА
+        if global_pending_count > 0:
+            st.warning(f"Найдено {global_pending_count} ссылок ожидающих проверки во всех папках.")
+            if st.button(f"🚀 ЗАПУСТИТЬ ВСЕ ({global_pending_count} шт.)", type="primary", use_container_width=True):
+                # Собираем все pending ссылки со всех проектов
+                pending_all = all_links_df[all_links_df['status'] == 'pending'][['id', 'url']].to_dict('records')
+                run_check(pending_all)
+        else:
+            st.success("Все ссылки проверены! Очередь пуста.")
+            
+        st.subheader("Сводная таблица")
+        st.dataframe(
+            stats_df, 
+            use_container_width=True,
+            column_config={
+                "Последняя проверка": st.column_config.DatetimeColumn(format="D MMM YYYY, HH:mm"),
+            },
+            hide_index=True
+        )
+        
+    else:
+        st.info("Создайте первый проект в меню слева!")
