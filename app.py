@@ -15,7 +15,6 @@ st.set_page_config(page_title="SEO Index Manager", layout="wide")
 
 TASK_POST = "/v3/serp/google/organic/task_post"
 TASK_GET_ADV = "/v3/serp/google/organic/task_get/advanced/{task_id}"
-USER_DATA = "/v3/user_data" # Эндпоинт для баланса
 
 @st.cache_resource
 def init_supabase():
@@ -38,34 +37,6 @@ except Exception as e:
 # -----------------------
 # Хелперы
 # -----------------------
-def get_balance():
-    """Получает баланс по прямой ссылке"""
-    try:
-        session = init_requests()
-        # Жестко используем официальный URL, чтобы исключить ошибки в secrets
-        url = "https://api.dataforseo.com/v3/user_data"
-        
-        r = session.get(url, timeout=10)
-        
-        # Если все равно 404 или ошибка - вернем None (не будем крашить)
-        if r.status_code != 200:
-            return None
-
-        data = r.json()
-        
-        # Разбираем стандартный ответ V3
-        if data.get('status_code') == 20000:
-            tasks = data.get('tasks', [])
-            if tasks and len(tasks) > 0:
-                res = tasks[0].get('result', [])
-                if res and len(res) > 0:
-                    money = res[0].get('money')
-                    return float(money)
-    except Exception:
-        pass
-        
-    return None
-
 def to_excel(df):
     """Конвертирует DataFrame в Excel для скачивания"""
     output = BytesIO()
@@ -113,7 +84,7 @@ def parse_excel_urls(uploaded_file):
     return urls
 
 # -----------------------
-# Логика массовой проверки
+# Логика проверки
 # -----------------------
 def run_check(links_data):
     if not links_data: return
@@ -252,16 +223,6 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Ошибка удаления: {e}")
 
-    # БАЛАНС API (внизу сайдбара)
-    st.write("") # Отступ
-    st.write("") 
-    st.divider()
-    balance = get_balance()
-    if balance is not None:
-        st.metric("💰 Баланс DataForSEO", f"${balance:.2f}")
-    else:
-        st.caption("Не удалось загрузить баланс")
-
 # -----------------------
 # ЛОГИКА ЭКРАНОВ
 # -----------------------
@@ -279,9 +240,10 @@ if st.session_state.selected_project_id:
     df = pd.DataFrame(res.data)
 
     if not df.empty:
-        # Метрики
+        # --- Метрики (Считаем для отображения) ---
         total = len(df)
         indexed = len(df[df['is_indexed'] == True])
+        not_indexed = len(df[df['is_indexed'] == False])
         pending = len(df[df['status'] == 'pending'])
         
         c1, c2, c3, c4 = st.columns(4)
@@ -295,29 +257,54 @@ if st.session_state.selected_project_id:
                     to_check = df[df['status'] == 'pending'][['id', 'url']].to_dict('records')
                     run_check(to_check)
             else:
-                if st.button("🔄 Сбросить и проверить заново"):
+                if st.button("🔄 Перепроверить всё"):
                     supabase.table("links").update({"status": "pending", "is_indexed": None}).eq("project_id", st.session_state.selected_project_id).execute()
                     st.rerun()
         
         st.divider()
 
-        # КНОПКА ЭКСПОРТА (над таблицей)
-        col_title, col_export = st.columns([3, 1])
-        col_title.subheader("Список ссылок")
+        # --- БЛОК ФИЛЬТРА И ЭКСПОРТА ---
+        col_filter, col_export = st.columns([4, 1])
+        
+        with col_filter:
+            # Умный фильтр с подсчетом
+            filter_option = st.radio(
+                "Фильтр отображения:",
+                [
+                    f"Все ({total})", 
+                    f"✅ В индексе ({indexed})", 
+                    f"❌ Не в индексе ({not_indexed})", 
+                    f"⏳ Ожидание/Ошибки ({pending})"
+                ],
+                horizontal=True,
+                label_visibility="collapsed"
+            )
+            
+            # Применяем фильтр к DataFrame
+            if "✅" in filter_option:
+                df_view = df[df['is_indexed'] == True]
+            elif "❌" in filter_option:
+                df_view = df[df['is_indexed'] == False]
+            elif "⏳" in filter_option:
+                df_view = df[df['status'].isin(['pending', 'error'])]
+            else:
+                df_view = df
+
         with col_export:
-            # Готовим Excel
+            # Скачиваем ВСЕГДА полный отчет, так полезнее
             excel_data = to_excel(df[['url', 'is_indexed', 'status', 'last_check']])
             st.download_button(
-                label="📥 Скачать отчет (.xlsx)",
+                label="📥 Скачать отчет",
                 data=excel_data,
                 file_name=f"report_{current_proj['name']}_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True
             )
         
-        # Таблица
+        # --- ТАБЛИЦА ---
+        st.write("") # отступ
         selection = st.dataframe(
-            df[['url', 'status', 'is_indexed', 'last_check', 'created_at']], 
+            df_view[['url', 'status', 'is_indexed', 'last_check', 'created_at']], 
             use_container_width=True,
             on_select="rerun", 
             selection_mode="multi-row",
@@ -328,9 +315,12 @@ if st.session_state.selected_project_id:
             }
         )
         
+        # Кнопка удаления (работает с отфильтрованными данными)
         if len(selection.selection.rows) > 0:
             selected_indices = selection.selection.rows
-            selected_ids = df.iloc[selected_indices]['id'].tolist()
+            # Берем ID именно из отфильтрованной таблицы
+            selected_ids = df_view.iloc[selected_indices]['id'].tolist()
+            
             st.warning(f"Выбрано {len(selected_ids)} ссылок.")
             if st.button(f"🗑 Удалить выбранные ({len(selected_ids)} шт)", type="primary"):
                 supabase.table("links").delete().in_("id", selected_ids).execute()
