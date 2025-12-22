@@ -39,18 +39,37 @@ except Exception as e:
 # Хелперы
 # -----------------------
 def get_balance():
-    """Получает баланс аккаунта DataForSEO"""
+    """Получает баланс с выводом ошибки для отладки"""
     try:
         session = init_requests()
-        host = st.secrets["dataforseo"].get("host", "api.dataforseo.com").replace("https://", "")
-        # Пробуем получить данные пользователя
-        r = session.get(f"https://{host}{USER_DATA}", timeout=10)
+        # Чистим хост от лишнего мусора (http, слэши)
+        host_secret = st.secrets["dataforseo"].get("host", "api.dataforseo.com")
+        host = host_secret.replace("https://", "").replace("http://", "").strip().strip("/")
+        
+        # Строим чистый URL
+        url = f"https://{host}/v3/user_data"
+        
+        r = session.get(url, timeout=10)
+        
+        # Если сервер ответил ошибкой (например 404 или 401)
+        if r.status_code != 200:
+            st.sidebar.error(f"HTTP {r.status_code}")
+            return None
+
         data = r.json()
+        
+        # Проверяем структуру JSON аккуратно
         if data.get('status_code') == 20000:
-            money = data.get('tasks', [{}])[0].get('result', [{}])[0].get('money', 0)
-            return float(money)
-    except Exception:
-        pass
+            tasks = data.get('tasks')
+            if tasks and isinstance(tasks, list) and len(tasks) > 0:
+                result = tasks[0].get('result')
+                if result and isinstance(result, list) and len(result) > 0:
+                    money = result[0].get('money')
+                    return float(money)
+    except Exception as e:
+        # Показываем реальную ошибку в интерфейсе
+        st.sidebar.error(f"Err: {e}")
+        
     return None
 
 def to_excel(df):
