@@ -6,7 +6,7 @@ from openpyxl import load_workbook
 import time
 import requests
 from urllib.parse import urlparse, urlunparse
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # -----------------------
 # Конфигурация и API
@@ -14,7 +14,6 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="SEO Index Manager", layout="wide")
 
 TASK_POST = "/v3/serp/google/organic/task_post"
-TASKS_READY = "/v3/serp/google/organic/tasks_ready"
 TASK_GET_ADV = "/v3/serp/google/organic/task_get/advanced/{task_id}"
 
 @st.cache_resource
@@ -80,10 +79,6 @@ def parse_excel_urls(uploaded_file):
 # Логика массовой проверки
 # -----------------------
 def run_check(links_data):
-    """
-    Принимает список словарей [{'id': 1, 'url': '...'}, ...]
-    Может принимать ссылки из разных проектов сразу.
-    """
     if not links_data: return
     
     session = init_requests()
@@ -96,7 +91,6 @@ def run_check(links_data):
     payload = []
     tasks_map = {} 
     
-    # Подготовка Payload
     for item in links_data:
         payload.append({
             "location_code": 2840,
@@ -130,11 +124,9 @@ def run_check(links_data):
                 
                 if not batch_task_ids: continue
 
-                # Ожидание
-                time.sleep(2) # Небольшая пауза перед поллингом
+                time.sleep(2)
                 status_text.write("⏳ Анализ результатов...")
                 
-                # Получение результатов (поштучно для надежности)
                 for tid in batch_task_ids:
                     try:
                         r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
@@ -173,12 +165,12 @@ def run_check(links_data):
     st.rerun()
 
 # -----------------------
-# Сайдбар
+# САЙДБАР
 # -----------------------
 with st.sidebar:
     st.title("🗂 Меню")
     
-    if st.button("🏠 На главную (Дашборд)"):
+    if st.button("🏠 На главную (Дашборд)", use_container_width=True):
         st.session_state.selected_project_id = None
         st.rerun()
     
@@ -197,22 +189,39 @@ with st.sidebar:
     response = supabase.table("projects").select("*").order("created_at", desc=True).execute()
     projects = response.data
     
-    # Используем session_state для хранения выбранного проекта
     if "selected_project_id" not in st.session_state:
         st.session_state.selected_project_id = None
 
     if projects:
         for p in projects:
-            # Делаем кнопки вместо selectbox для удобства
-            if st.button(f"📂 {p['name']}", key=p['id'], use_container_width=True):
+            # Кнопки для выбора проектов
+            is_active = (st.session_state.selected_project_id == p['id'])
+            label = f"{'📂' if not is_active else '📂'} {p['name']}"
+            if st.button(label, key=f"proj_{p['id']}", use_container_width=True, type="secondary" if not is_active else "primary"):
                 st.session_state.selected_project_id = p['id']
                 st.rerun()
+    
+    # === БЛОК УДАЛЕНИЯ ПРОЕКТА (Только если проект выбран) ===
+    if st.session_state.selected_project_id:
+        st.divider()
+        with st.expander("⚙️ Настройки проекта"):
+            st.caption("Опасная зона")
+            if st.button("🗑 Удалить этот проект", type="primary"):
+                try:
+                    # Удаляем проект. Ссылки удалятся автоматически (cascade)
+                    supabase.table("projects").delete().eq("id", st.session_state.selected_project_id).execute()
+                    st.session_state.selected_project_id = None
+                    st.success("Проект удален!")
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Ошибка удаления: {e}")
 
 # -----------------------
 # ЛОГИКА ЭКРАНОВ
 # -----------------------
 
-# 1. ЭКРАН ПРОЕКТА (если выбран)
+# 1. ЭКРАН ПРОЕКТА
 if st.session_state.selected_project_id:
     # Ищем имя проекта
     current_proj = next((p for p in projects if p['id'] == st.session_state.selected_project_id), None)
@@ -220,24 +229,23 @@ if st.session_state.selected_project_id:
         st.session_state.selected_project_id = None
         st.rerun()
         
-    st.title(f"📂 Проект: {current_proj['name']}")
+    st.title(f"📂 {current_proj['name']}")
     
     # Грузим ссылки
     res = supabase.table("links").select("*").eq("project_id", st.session_state.selected_project_id).order("id", desc=False).execute()
     df = pd.DataFrame(res.data)
 
     if not df.empty:
+        # Метрики
         total = len(df)
         indexed = len(df[df['is_indexed'] == True])
         pending = len(df[df['status'] == 'pending'])
         
-        # Метрики
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Всего", total)
         c2.metric("В индексе", f"{indexed} ({(indexed/total*100):.1f}%)")
         c3.metric("Очередь", pending)
         
-        # Кнопки действий
         with c4:
             if pending > 0:
                 if st.button("🚀 Проверить очередь", type="primary"):
@@ -248,17 +256,36 @@ if st.session_state.selected_project_id:
                     supabase.table("links").update({"status": "pending", "is_indexed": None}).eq("project_id", st.session_state.selected_project_id).execute()
                     st.rerun()
                     
-        # Таблица
         st.divider()
-        st.dataframe(
+        st.subheader("Список ссылок")
+        
+        # === ТАБЛИЦА С ВЫБОРОМ ДЛЯ УДАЛЕНИЯ ===
+        # Используем selection_mode="multi-row"
+        selection = st.dataframe(
             df[['url', 'status', 'is_indexed', 'last_check', 'created_at']], 
             use_container_width=True,
+            on_select="rerun", # Перезагрузка при выделении для показа кнопки
+            selection_mode="multi-row",
             column_config={
                 "is_indexed": st.column_config.CheckboxColumn("Index?", disabled=True),
                 "url": st.column_config.LinkColumn("URL"),
                 "last_check": st.column_config.DatetimeColumn("Дата проверки", format="D MMM YYYY, HH:mm")
             }
         )
+        
+        # Если выбраны строки - показываем кнопку удаления
+        if len(selection.selection.rows) > 0:
+            selected_indices = selection.selection.rows
+            # Получаем реальные ID из dataframe по индексам
+            selected_ids = df.iloc[selected_indices]['id'].tolist()
+            
+            st.warning(f"Выбрано {len(selected_ids)} ссылок.")
+            if st.button(f"🗑 Удалить выбранные ({len(selected_ids)} шт)", type="primary"):
+                supabase.table("links").delete().in_("id", selected_ids).execute()
+                st.success("Удалено!")
+                time.sleep(1)
+                st.rerun()
+
     else:
         st.info("В папке пусто.")
     
@@ -269,6 +296,7 @@ if st.session_state.selected_project_id:
             urls = parse_excel_urls(uploaded)
             if urls:
                 data = [{"project_id": st.session_state.selected_project_id, "url": u, "status": "pending"} for u in urls]
+                # Batch insert
                 batch_size = 1000
                 bar = st.progress(0)
                 for i in range(0, len(data), batch_size):
@@ -278,12 +306,10 @@ if st.session_state.selected_project_id:
                 time.sleep(1)
                 st.rerun()
 
-# 2. ГЛАВНЫЙ ДАШБОРД (если проект не выбран)
+# 2. ГЛАВНЫЙ ДАШБОРД
 else:
     st.title("📊 Дашборд мониторинга")
     
-    # Получаем ВСЕ ссылки сразу, чтобы посчитать статистику
-    # В идеале это делать через RPC на стороне базы, но для тысяч строк Python справится
     all_links_res = supabase.table("links").select("id, project_id, status, is_indexed, last_check, url").execute()
     all_links_df = pd.DataFrame(all_links_res.data)
     
@@ -298,11 +324,7 @@ else:
                 total = len(p_links)
                 idx = len(p_links[p_links['is_indexed'] == True])
                 pend = len(p_links[p_links['status'] == 'pending'])
-                
-                # Ищем самую свежую дату проверки
-                last_date = None
-                if not p_links['last_check'].isna().all():
-                    last_date = pd.to_datetime(p_links['last_check']).max()
+                last_date = pd.to_datetime(p_links['last_check']).max() if not p_links['last_check'].isna().all() else None
             else:
                 total, idx, pend, last_date = 0, 0, 0, None
                 
@@ -320,16 +342,13 @@ else:
             
         stats_df = pd.DataFrame(stats_data)
         
-        # Метрики дашборда
         m1, m2 = st.columns([3, 1])
         m1.metric("Всего проектов", len(projects))
         m2.metric("Всего задач в очереди", global_pending_count)
         
-        # ГЛОБАЛЬНАЯ КНОПКА ЗАПУСКА
         if global_pending_count > 0:
             st.warning(f"Найдено {global_pending_count} ссылок ожидающих проверки во всех папках.")
             if st.button(f"🚀 ЗАПУСТИТЬ ВСЕ ({global_pending_count} шт.)", type="primary", use_container_width=True):
-                # Собираем все pending ссылки со всех проектов
                 pending_all = all_links_df[all_links_df['status'] == 'pending'][['id', 'url']].to_dict('records')
                 run_check(pending_all)
         else:
