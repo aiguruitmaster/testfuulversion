@@ -15,6 +15,7 @@ st.set_page_config(page_title="SEO Index Manager", layout="wide")
 
 TASK_POST = "/v3/serp/google/organic/task_post"
 TASK_GET_ADV = "/v3/serp/google/organic/task_get/advanced/{task_id}"
+USER_DATA = "/v3/user_data" # Эндпоинт для баланса
 
 @st.cache_resource
 def init_supabase():
@@ -37,6 +38,29 @@ except Exception as e:
 # -----------------------
 # Хелперы
 # -----------------------
+def get_balance():
+    """Получает баланс аккаунта DataForSEO"""
+    try:
+        session = init_requests()
+        host = st.secrets["dataforseo"].get("host", "api.dataforseo.com").replace("https://", "")
+        # Пробуем получить данные пользователя
+        r = session.get(f"https://{host}{USER_DATA}", timeout=10)
+        data = r.json()
+        if data.get('status_code') == 20000:
+            money = data.get('tasks', [{}])[0].get('result', [{}])[0].get('money', 0)
+            return float(money)
+    except Exception:
+        pass
+    return None
+
+def to_excel(df):
+    """Конвертирует DataFrame в Excel для скачивания"""
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Report')
+    processed_data = output.getvalue()
+    return processed_data
+
 def norm_url(u: str) -> str:
     p = urlparse(u.strip())
     netloc = (p.netloc or "").lower()
@@ -194,21 +218,19 @@ with st.sidebar:
 
     if projects:
         for p in projects:
-            # Кнопки для выбора проектов
             is_active = (st.session_state.selected_project_id == p['id'])
             label = f"{'📂' if not is_active else '📂'} {p['name']}"
             if st.button(label, key=f"proj_{p['id']}", use_container_width=True, type="secondary" if not is_active else "primary"):
                 st.session_state.selected_project_id = p['id']
                 st.rerun()
     
-    # === БЛОК УДАЛЕНИЯ ПРОЕКТА (Только если проект выбран) ===
+    # Удаление проекта
     if st.session_state.selected_project_id:
         st.divider()
         with st.expander("⚙️ Настройки проекта"):
             st.caption("Опасная зона")
             if st.button("🗑 Удалить этот проект", type="primary"):
                 try:
-                    # Удаляем проект. Ссылки удалятся автоматически (cascade)
                     supabase.table("projects").delete().eq("id", st.session_state.selected_project_id).execute()
                     st.session_state.selected_project_id = None
                     st.success("Проект удален!")
@@ -217,13 +239,22 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Ошибка удаления: {e}")
 
+    # БАЛАНС API (внизу сайдбара)
+    st.write("") # Отступ
+    st.write("") 
+    st.divider()
+    balance = get_balance()
+    if balance is not None:
+        st.metric("💰 Баланс DataForSEO", f"${balance:.2f}")
+    else:
+        st.caption("Не удалось загрузить баланс")
+
 # -----------------------
 # ЛОГИКА ЭКРАНОВ
 # -----------------------
 
 # 1. ЭКРАН ПРОЕКТА
 if st.session_state.selected_project_id:
-    # Ищем имя проекта
     current_proj = next((p for p in projects if p['id'] == st.session_state.selected_project_id), None)
     if not current_proj:
         st.session_state.selected_project_id = None
@@ -231,7 +262,6 @@ if st.session_state.selected_project_id:
         
     st.title(f"📂 {current_proj['name']}")
     
-    # Грузим ссылки
     res = supabase.table("links").select("*").eq("project_id", st.session_state.selected_project_id).order("id", desc=False).execute()
     df = pd.DataFrame(res.data)
 
@@ -255,16 +285,28 @@ if st.session_state.selected_project_id:
                 if st.button("🔄 Сбросить и проверить заново"):
                     supabase.table("links").update({"status": "pending", "is_indexed": None}).eq("project_id", st.session_state.selected_project_id).execute()
                     st.rerun()
-                    
-        st.divider()
-        st.subheader("Список ссылок")
         
-        # === ТАБЛИЦА С ВЫБОРОМ ДЛЯ УДАЛЕНИЯ ===
-        # Используем selection_mode="multi-row"
+        st.divider()
+
+        # КНОПКА ЭКСПОРТА (над таблицей)
+        col_title, col_export = st.columns([3, 1])
+        col_title.subheader("Список ссылок")
+        with col_export:
+            # Готовим Excel
+            excel_data = to_excel(df[['url', 'is_indexed', 'status', 'last_check']])
+            st.download_button(
+                label="📥 Скачать отчет (.xlsx)",
+                data=excel_data,
+                file_name=f"report_{current_proj['name']}_{datetime.now().strftime('%Y-%m-%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        
+        # Таблица
         selection = st.dataframe(
             df[['url', 'status', 'is_indexed', 'last_check', 'created_at']], 
             use_container_width=True,
-            on_select="rerun", # Перезагрузка при выделении для показа кнопки
+            on_select="rerun", 
             selection_mode="multi-row",
             column_config={
                 "is_indexed": st.column_config.CheckboxColumn("Index?", disabled=True),
@@ -273,12 +315,9 @@ if st.session_state.selected_project_id:
             }
         )
         
-        # Если выбраны строки - показываем кнопку удаления
         if len(selection.selection.rows) > 0:
             selected_indices = selection.selection.rows
-            # Получаем реальные ID из dataframe по индексам
             selected_ids = df.iloc[selected_indices]['id'].tolist()
-            
             st.warning(f"Выбрано {len(selected_ids)} ссылок.")
             if st.button(f"🗑 Удалить выбранные ({len(selected_ids)} шт)", type="primary"):
                 supabase.table("links").delete().in_("id", selected_ids).execute()
@@ -289,14 +328,12 @@ if st.session_state.selected_project_id:
     else:
         st.info("В папке пусто.")
     
-    # Загрузка
     with st.expander("📥 Добавить Excel файл", expanded=(df.empty)):
         uploaded = st.file_uploader("Загрузить ссылки (колонка B)", type=["xlsx"])
         if uploaded and st.button("Сохранить в базу"):
             urls = parse_excel_urls(uploaded)
             if urls:
                 data = [{"project_id": st.session_state.selected_project_id, "url": u, "status": "pending"} for u in urls]
-                # Batch insert
                 batch_size = 1000
                 bar = st.progress(0)
                 for i in range(0, len(data), batch_size):
