@@ -13,34 +13,6 @@ from datetime import datetime
 # -----------------------
 st.set_page_config(page_title="SEO Index Manager", layout="wide")
 
-# -----------------------
-# 🔐 СИСТЕМА АВТОРИЗАЦИИ
-# -----------------------
-def check_password():
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-    
-    # Если уже вошли - пропускаем
-    if st.session_state.authenticated:
-        return True
-
-    # Экран входа
-    st.title("🔒 Вход в систему")
-    password = st.text_input("Введите пароль доступа", type="password")
-    
-    if st.button("Войти"):
-        # Пароль берется из secrets.toml
-        if password == st.secrets["auth"]["password"]:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("Неверный пароль!")
-    return False
-
-# Блокируем выполнение, пока не введен пароль
-if not check_password():
-    st.stop()
-
 # ==========================================
 # ОСНОВНОЕ ПРИЛОЖЕНИЕ
 # ==========================================
@@ -279,14 +251,6 @@ with st.sidebar:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Ошибка удаления: {e}")
-
-    # Выход
-    st.write("")
-    st.write("")
-    st.divider()
-    if st.button("🚪 Выйти", use_container_width=True):
-        st.session_state.authenticated = False
-        st.rerun()
 
 # -----------------------
 # ЛОГИКА ЭКРАНОВ
