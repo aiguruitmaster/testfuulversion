@@ -41,7 +41,7 @@ except Exception as e:
     st.stop()
 
 # -----------------------
-# Хелперы Slack и Excel
+# Хелперы
 # -----------------------
 def send_slack_file(file_bytes, filename, message):
     """Отправка файла в Slack с ВЫВОДОМ ОШИБОК"""
@@ -56,7 +56,6 @@ def send_slack_file(file_bytes, filename, message):
 
             client = WebClient(token=token)
             
-            # Пытаемся отправить
             client.files_upload_v2(
                 channel=channel,
                 file=file_bytes,
@@ -67,23 +66,11 @@ def send_slack_file(file_bytes, filename, message):
             st.success("✅ Отчет успешно отправлен в Slack!")
             
         else:
-            st.error("❌ Ошибка: Секция [slack] не найдена в secrets.toml")
+            st.warning("⚠️ Секция [slack] не найдена, уведомление не отправлено.")
 
     except SlackApiError as e:
-        # ВОТ ЭТО ПОКАЖЕТ НАМ ПРИЧИНУ
         error_code = e.response['error']
         st.error(f"❌ Ошибка Slack API: {error_code}")
-        
-        # Подсказки по частым ошибкам
-        if error_code == 'not_in_channel':
-            st.warning("💡 Решение: Бот не добавлен в канал. Зайди в канал Slack и напиши: /invite @ИмяБота")
-        elif error_code == 'missing_scope':
-            st.warning("💡 Решение: У бота нет прав. Добавь 'files:write' и 'chat:write' в настройках Slack и ПЕРЕУСТАНОВИ приложение.")
-        elif error_code == 'channel_not_found':
-            st.warning("💡 Решение: ID канала указан неверно. Это должен быть код типа C07A12BC, а не название #general.")
-        elif error_code == 'invalid_auth':
-            st.warning("💡 Решение: Неверный токен. Скопируй 'Bot User OAuth Token' заново (начинается на xoxb-...).")
-
     except Exception as e:
         st.error(f"❌ Общая ошибка отправки: {e}")
 
@@ -242,7 +229,7 @@ def run_check(links_data, project_id=None, is_global=False):
         except Exception as e:
             st.error(f"Network error: {e}")
 
-    # === ОТПРАВКА С ДИАГНОСТИКОЙ ===
+    # === ОТПРАВКА ===
     status_text.write("📊 Формирование отчета Excel...")
     target_proj_id = None if is_global else project_id
     excel_bytes = generate_full_report(target_proj_id)
@@ -251,11 +238,9 @@ def run_check(links_data, project_id=None, is_global=False):
         date_str = datetime.now().strftime('%Y-%m-%d')
         fname = f"Global_Report_{date_str}.xlsx" if is_global else f"Project_Report_{date_str}.xlsx"
         msg = f"✅ *Проверка завершена!*\nВсего проверено: {total}"
-        
-        # Вызов обновленной функции
         send_slack_file(excel_bytes, fname, msg)
     else:
-        st.error("Не удалось сформировать данные для Excel.")
+        st.error("Не удалось сформировать данные.")
         
     time.sleep(2)
     st.rerun()
@@ -336,7 +321,8 @@ if st.session_state.selected_project_id:
                     to_check = df[df['status'] == 'pending'][['id', 'url']].to_dict('records')
                     run_check(to_check, project_id=st.session_state.selected_project_id, is_global=False)
             else:
-                if st.button("🔄 Перепроверить всё"):
+                if st.button("🔄 Перепроверить эту папку"):
+                    # Сброс только текущей папки
                     supabase.table("links").update({"status": "pending", "is_indexed": None}).eq("project_id", st.session_state.selected_project_id).execute()
                     st.rerun()
         st.divider()
@@ -407,12 +393,16 @@ if st.session_state.selected_project_id:
                 if text_input: st.warning("Не найдено корректных ссылок")
 
 else:
+    # --- ДАШБОРД ---
     st.title("📊 Дашборд мониторинга")
     all_links_res = supabase.table("links").select("id, project_id, status, is_indexed, last_check, url").execute()
     all_links_df = pd.DataFrame(all_links_res.data)
+    
     if projects:
         stats_data = []
         global_pending_count = 0
+        total_all_links_count = 0 # Считаем общее количество ссылок
+        
         for p in projects:
             pid = p['id']
             if not all_links_df.empty:
@@ -423,12 +413,17 @@ else:
                 last_date = pd.to_datetime(p_links['last_check']).max() if not p_links['last_check'].isna().all() else None
             else:
                 total, idx, pend, last_date = 0, 0, 0, None
+            
             global_pending_count += pend
+            total_all_links_count += total
+            
             stats_data.append({"ID": pid, "Проект": p['name'], "Всего ссылок": total, "В индексе": idx, "% Index": f"{(idx/total*100):.1f}%" if total > 0 else "0%", "Очередь": pend, "Последняя проверка": last_date})
+        
         stats_df = pd.DataFrame(stats_data)
         m1, m2 = st.columns([3, 1])
         m1.metric("Всего проектов", len(projects))
         m2.metric("Всего задач в очереди", global_pending_count)
+        
         if global_pending_count > 0:
             st.warning(f"Найдено {global_pending_count} ссылок ожидающих проверки во всех папках.")
             if st.button(f"🚀 ЗАПУСТИТЬ ВСЕ ({global_pending_count} шт.)", type="primary", use_container_width=True):
@@ -436,6 +431,19 @@ else:
                 run_check(pending_all, is_global=True)
         else:
             st.success("Все ссылки проверены! Очередь пуста.")
+            # === ВОТ ЭТА КНОПКА ПОЯВЛЯЕТСЯ, КОГДА ВСЕ ПРОВЕРЕНО ===
+            st.write("")
+            if st.button(f"🔄 Сбросить статусы и перепроверить ВСЕ ПРОЕКТЫ ({total_all_links_count} шт)", type="secondary"):
+                 # Сбрасываем статус ВСЕМ ссылкам (которые есть в DataFrame)
+                 if not all_links_df.empty:
+                     all_ids = all_links_df['id'].tolist()
+                     # Пакетное обновление статуса
+                     supabase.table("links").update({"status": "pending", "is_indexed": None}).in_("id", all_ids).execute()
+                     
+                     # Запуск проверки
+                     all_records = all_links_df[['id', 'url']].to_dict('records')
+                     run_check(all_records, is_global=True)
+
         st.subheader("Сводная таблица")
         st.dataframe(stats_df, use_container_width=True, hide_index=True)
     else:
