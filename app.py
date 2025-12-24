@@ -104,7 +104,7 @@ def parse_text_urls(text_input):
 # -----------------------
 # ЛОГИКА ПРОВЕРКИ
 # -----------------------
-def run_check(links_data):
+def run_check(links_data, report_name_prefix="Report"):
     if not links_data: return
     session = init_requests()
     host = st.secrets["dataforseo"].get("host", "api.dataforseo.com").replace("https://", "")
@@ -171,6 +171,24 @@ def run_check(links_data):
             st.error(f"Net Error: {e}")
         time.sleep(1.5)
 
+    # === ГЕНЕРАЦИЯ ОТЧЕТА (ПРОСТОЙ EXCEL ДЛЯ ГЛОБАЛЬНОЙ) ===
+    status_text.write("📊 Отправка отчета...")
+    try:
+        # Собираем данные для отчета из только что проверенных
+        checked_ids = [item['id'] for item in links_data]
+        res = supabase.table("links").select("url, status, is_indexed, last_check").in_("id", checked_ids).execute()
+        df_report = pd.DataFrame(res.data)
+        
+        if not df_report.empty:
+            excel_bytes = to_excel(df_report)
+            date_str = datetime.now().strftime('%Y-%m-%d')
+            fname = f"{report_name_prefix}_{date_str}.xlsx"
+            msg = f"✅ *Проверка завершена ({report_name_prefix})!*\n🔗 Всего: {total}"
+            send_slack_file(excel_bytes, fname, msg)
+            
+    except Exception as e:
+        st.error(f"Ошибка отчета: {e}")
+
     status_text.success("✅ Готово!")
     time.sleep(1)
     st.rerun()
@@ -183,7 +201,7 @@ def run_check(links_data):
 with st.sidebar:
     st.title("🗂 Навигация")
     
-    if st.button("🏠 Все проекты", use_container_width=True):
+    if st.button("🏠 Все проекты (Главная)", use_container_width=True):
         st.session_state.selected_project_id = None
         st.session_state.selected_folder_id = None
         st.rerun()
@@ -209,7 +227,6 @@ with st.sidebar:
             supabase.table("projects").insert({"name": new_p}).execute()
             st.rerun()
 
-    # === УДАЛЕНИЕ ПРОЕКТА (Вернули на место) ===
     if st.session_state.selected_project_id:
         st.write("")
         st.divider()
@@ -225,27 +242,76 @@ with st.sidebar:
 
 # --- ЛОГИКА ОТОБРАЖЕНИЯ ---
 
-# 1. ГЛАВНАЯ
+# 1. ГЛАВНАЯ (ДАШБОРД ВСЕХ ПРОЕКТОВ + ГЛОБАЛЬНЫЙ ЗАПУСК)
 if not st.session_state.selected_project_id:
     st.title("📊 Все проекты")
+    
     if not projs:
         st.info("Нет проектов. Создайте первый в меню слева.")
     else:
-        all_links = supabase.table("links").select("id").execute().data
-        st.metric("Всего ссылок в системе", len(all_links))
-        st.write("Выберите проект слева, чтобы начать работу.")
+        # Статистика по всем проектам
+        all_links_res = supabase.table("links").select("id, project_id, status, is_indexed").execute()
+        df_all = pd.DataFrame(all_links_res.data)
+        
+        # Сводная таблица
+        stats_data = []
+        global_pending_count = 0
+        
+        for p in projs:
+            if not df_all.empty:
+                p_links = df_all[df_all['project_id'] == p['id']]
+                cnt = len(p_links)
+                pend = len(p_links[p_links['status'] == 'pending'])
+                idx = len(p_links[p_links['is_indexed'] == True])
+            else:
+                cnt, pend, idx = 0, 0, 0
+            
+            global_pending_count += pend
+            stats_data.append({
+                "Проект": p['name'],
+                "Всего ссылок": cnt,
+                "В индексе": idx,
+                "В очереди": pend
+            })
+        
+        # Метрики
+        m1, m2 = st.columns(2)
+        m1.metric("Всего проектов", len(projs))
+        m2.metric("ВСЕГО В ОЧЕРЕДИ", global_pending_count)
+
+        st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
+
+        st.divider()
+        
+        # === КНОПКА ГЛОБАЛЬНОГО ЗАПУСКА ===
+        if global_pending_count > 0:
+            st.warning(f"Готово к проверке: **{global_pending_count}** ссылок во всех проектах.")
+            if st.button(f"🚀 ЗАПУСТИТЬ ПРОВЕРКУ ВСЕХ ПРОЕКТОВ ({global_pending_count} шт)", type="primary", use_container_width=True):
+                 # Берем все ссылки со статусом pending
+                 pending_links = df_all[df_all['status'] == 'pending'][['id', 'url']].to_dict('records')
+                 # Нужно получить URL, т.к. в df_all их нет для экономии, делаем доп запрос если надо или сразу берем всё
+                 # Правильнее сделать запрос только нужных
+                 pending_full = supabase.table("links").select("id, url").eq("status", "pending").execute().data
+                 run_check(pending_full, report_name_prefix="Global_Check")
+        else:
+            st.success("Очередь пуста во всех проектах.")
+            
+            # Кнопка сброса ВСЕГО
+            st.write("")
+            if st.button("🔄 Сбросить статусы ВО ВСЕХ ПРОЕКТАХ и проверить заново"):
+                # Сброс
+                supabase.table("links").update({"status": "pending", "is_indexed": None}).neq("id", 0).execute()
+                st.rerun()
 
 # 2. ПРОСМОТР ПРОЕКТА (СПИСОК ПАПОК)
 elif st.session_state.selected_project_id and st.session_state.selected_folder_id is None:
     curr_proj = next(p for p in projs if p['id'] == st.session_state.selected_project_id)
     st.title(f"📂 {curr_proj['name']}")
-    st.caption("Структура папок")
     
     folders = supabase.table("folders").select("*").eq("project_id", curr_proj['id']).order("created_at", desc=False).execute().data
     links_res = supabase.table("links").select("folder_id, status, is_indexed").eq("project_id", curr_proj['id']).execute()
     df_links = pd.DataFrame(links_res.data)
     
-    # --- КАРТОЧКИ ПАПОК ---
     if folders:
         for f in folders:
             if not df_links.empty:
@@ -256,7 +322,6 @@ elif st.session_state.selected_project_id and st.session_state.selected_folder_i
                 total, indexed = 0, 0
             
             with st.container(border=True):
-                # Добавили колонку для кнопки удаления
                 c1, c2, c3 = st.columns([3, 1, 0.5]) 
                 with c1:
                     st.subheader(f"📁 {f['name']}")
@@ -266,16 +331,12 @@ elif st.session_state.selected_project_id and st.session_state.selected_folder_i
                     if st.button("Открыть ➡", key=f"open_{f['id']}", use_container_width=True):
                         st.session_state.selected_folder_id = f['id']
                         st.rerun()
-                # КНОПКА УДАЛЕНИЯ ПОДПАПКИ
                 with c3:
                     st.write("")
-                    if st.button("🗑", key=f"del_f_{f['id']}", help="Удалить папку"):
-                        # Удаляем папку (ссылки станут General из-за настройки БД on delete set null, или удалятся если cascade)
-                        # Лучше явно удалить папку, ссылки обычно остаются но становятся "без папки"
+                    if st.button("🗑", key=f"del_f_{f['id']}"):
                         supabase.table("folders").delete().eq("id", f['id']).execute()
                         st.rerun()
     
-    # General папка
     gen_links = df_links[df_links['folder_id'].isnull()] if not df_links.empty else pd.DataFrame()
     if not gen_links.empty:
         with st.container(border=True):
@@ -288,9 +349,6 @@ elif st.session_state.selected_project_id and st.session_state.selected_folder_i
                 if st.button("Открыть ➡", key="open_general", use_container_width=True):
                     st.session_state.selected_folder_id = -1
                     st.rerun()
-            with c3:
-                st.write("") 
-                # General удалить нельзя
 
     st.divider()
     with st.popover("➕ Добавить новую папку"):
@@ -303,9 +361,9 @@ elif st.session_state.selected_project_id and st.session_state.selected_folder_i
     if not df_links.empty:
         pending = len(df_links[df_links['status'] == 'pending'])
         if pending > 0:
-            if st.button(f"🚀 Проверить весь проект ({pending} в очереди)", type="primary"):
+            if st.button(f"🚀 Проверить ВЕСЬ ПРОЕКТ ({pending} в очереди)", type="primary"):
                  to_check = supabase.table("links").select("id, url").eq("project_id", curr_proj['id']).eq("status", "pending").execute().data
-                 run_check(to_check)
+                 run_check(to_check, report_name_prefix=f"Project_{curr_proj['name']}")
 
 # 3. ВНУТРИ ПАПКИ
 elif st.session_state.selected_folder_id is not None:
@@ -356,7 +414,7 @@ elif st.session_state.selected_folder_id is not None:
             if pending > 0:
                 if st.button("🚀 Проверить эту папку", type="primary"):
                     to_check = df[df['status'] == 'pending'][['id', 'url']].to_dict('records')
-                    run_check(to_check)
+                    run_check(to_check, report_name_prefix=f"Folder_{folder_name}")
             else:
                 if st.button("🔄 Перепроверить папку"):
                     ids = df['id'].tolist()
