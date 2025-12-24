@@ -1,4 +1,6 @@
 streamlit
+supabase
+pandas
 openpyxl
 requests
-supabase
+slack_sdk
