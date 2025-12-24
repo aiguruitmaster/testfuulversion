@@ -171,10 +171,8 @@ def run_check(links_data, report_name_prefix="Report"):
             st.error(f"Net Error: {e}")
         time.sleep(1.5)
 
-    # === ГЕНЕРАЦИЯ ОТЧЕТА (ПРОСТОЙ EXCEL ДЛЯ ГЛОБАЛЬНОЙ) ===
     status_text.write("📊 Отправка отчета...")
     try:
-        # Собираем данные для отчета из только что проверенных
         checked_ids = [item['id'] for item in links_data]
         res = supabase.table("links").select("url, status, is_indexed, last_check").in_("id", checked_ids).execute()
         df_report = pd.DataFrame(res.data)
@@ -185,7 +183,6 @@ def run_check(links_data, report_name_prefix="Report"):
             fname = f"{report_name_prefix}_{date_str}.xlsx"
             msg = f"✅ *Проверка завершена ({report_name_prefix})!*\n🔗 Всего: {total}"
             send_slack_file(excel_bytes, fname, msg)
-            
     except Exception as e:
         st.error(f"Ошибка отчета: {e}")
 
@@ -194,32 +191,55 @@ def run_check(links_data, report_name_prefix="Report"):
     st.rerun()
 
 # ==========================================
-# ИНТЕРФЕЙС
+# САЙДБАР (ИЕРАРХИЯ)
 # ==========================================
-
-# --- САЙДБАР ---
 with st.sidebar:
     st.title("🗂 Навигация")
     
-    if st.button("🏠 Все проекты (Главная)", use_container_width=True):
+    if st.button("🏠 ГЛАВНАЯ (Все проекты)", use_container_width=True):
         st.session_state.selected_project_id = None
         st.session_state.selected_folder_id = None
         st.rerun()
     
     st.divider()
     
+    # 1. Загружаем проекты и папки сразу (оптимизация)
     projs = supabase.table("projects").select("*").order("created_at", desc=True).execute().data
+    all_folders = supabase.table("folders").select("*").order("name", desc=False).execute().data
     
-    st.caption("Проекты:")
     if projs:
+        st.caption("Ваши проекты:")
         for p in projs:
-            is_active = (st.session_state.selected_project_id == p['id'])
-            btn_type = "primary" if is_active else "secondary"
-            if st.button(f"📂 {p['name']}", key=f"p_{p['id']}", use_container_width=True, type=btn_type):
-                st.session_state.selected_project_id = p['id']
-                st.session_state.selected_folder_id = None
-                st.rerun()
+            # Определяем, открыт ли этот проект сейчас
+            is_expanded = (st.session_state.selected_project_id == p['id'])
+            
+            # Используем Expander как выпадающее меню
+            with st.expander(f"📂 {p['name']}", expanded=is_expanded):
                 
+                # Кнопка "Обзор проекта"
+                if st.button("📊 Обзор проекта", key=f"dash_{p['id']}", use_container_width=True):
+                    st.session_state.selected_project_id = p['id']
+                    st.session_state.selected_folder_id = None
+                    st.rerun()
+
+                # Фильтруем папки только этого проекта
+                p_folders = [f for f in all_folders if f['project_id'] == p['id']]
+                
+                # Рисуем подпапки с отступом (визуально)
+                if p_folders:
+                    for f in p_folders:
+                        # Используем emoji для иерархии
+                        if st.button(f"└ 📁 {f['name']}", key=f"sb_f_{f['id']}", use_container_width=True):
+                            st.session_state.selected_project_id = p['id']
+                            st.session_state.selected_folder_id = f['id']
+                            st.rerun()
+                
+                # Кнопка для General
+                if st.button("└ 📄 Общая (Без папки)", key=f"sb_gen_{p['id']}", use_container_width=True):
+                    st.session_state.selected_project_id = p['id']
+                    st.session_state.selected_folder_id = -1
+                    st.rerun()
+
     st.divider()
     with st.expander("➕ Создать Проект"):
         new_p = st.text_input("Имя проекта")
@@ -227,33 +247,32 @@ with st.sidebar:
             supabase.table("projects").insert({"name": new_p}).execute()
             st.rerun()
 
+    # Кнопка удаления (только если выбран проект)
     if st.session_state.selected_project_id:
         st.write("")
-        st.divider()
+        st.write("")
         with st.expander("🗑 Удалить текущий проект"):
-            st.warning("Внимание! Это удалит проект и ВСЕ ссылки внутри него.")
-            if st.button("Да, удалить проект", type="primary"):
+            if st.button("Да, удалить", type="primary"):
                 supabase.table("projects").delete().eq("id", st.session_state.selected_project_id).execute()
                 st.session_state.selected_project_id = None
                 st.session_state.selected_folder_id = None
-                st.success("Проект удален!")
-                time.sleep(1)
                 st.rerun()
 
-# --- ЛОГИКА ОТОБРАЖЕНИЯ ---
+# ==========================================
+# ОСНОВНОЙ ЭКРАН
+# ==========================================
 
-# 1. ГЛАВНАЯ (ДАШБОРД ВСЕХ ПРОЕКТОВ + ГЛОБАЛЬНЫЙ ЗАПУСК)
+# 1. ГЛАВНАЯ (ДАШБОРД)
 if not st.session_state.selected_project_id:
     st.title("📊 Все проекты")
     
     if not projs:
         st.info("Нет проектов. Создайте первый в меню слева.")
     else:
-        # Статистика по всем проектам
+        # Статистика
         all_links_res = supabase.table("links").select("id, project_id, status, is_indexed").execute()
         df_all = pd.DataFrame(all_links_res.data)
         
-        # Сводная таблица
         stats_data = []
         global_pending_count = 0
         
@@ -274,44 +293,36 @@ if not st.session_state.selected_project_id:
                 "В очереди": pend
             })
         
-        # Метрики
         m1, m2 = st.columns(2)
         m1.metric("Всего проектов", len(projs))
         m2.metric("ВСЕГО В ОЧЕРЕДИ", global_pending_count)
 
         st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
-
         st.divider()
         
-        # === КНОПКА ГЛОБАЛЬНОГО ЗАПУСКА ===
+        # ГЛОБАЛЬНЫЙ ЗАПУСК
         if global_pending_count > 0:
-            st.warning(f"Готово к проверке: **{global_pending_count}** ссылок во всех проектах.")
-            if st.button(f"🚀 ЗАПУСТИТЬ ПРОВЕРКУ ВСЕХ ПРОЕКТОВ ({global_pending_count} шт)", type="primary", use_container_width=True):
-                 # Берем все ссылки со статусом pending
-                 pending_links = df_all[df_all['status'] == 'pending'][['id', 'url']].to_dict('records')
-                 # Нужно получить URL, т.к. в df_all их нет для экономии, делаем доп запрос если надо или сразу берем всё
-                 # Правильнее сделать запрос только нужных
+            st.warning(f"Готово к проверке: **{global_pending_count}** ссылок.")
+            if st.button(f"🚀 ЗАПУСТИТЬ ПРОВЕРКУ ВСЕХ ПРОЕКТОВ", type="primary", use_container_width=True):
                  pending_full = supabase.table("links").select("id, url").eq("status", "pending").execute().data
                  run_check(pending_full, report_name_prefix="Global_Check")
         else:
-            st.success("Очередь пуста во всех проектах.")
-            
-            # Кнопка сброса ВСЕГО
+            st.success("Очередь пуста.")
             st.write("")
             if st.button("🔄 Сбросить статусы ВО ВСЕХ ПРОЕКТАХ и проверить заново"):
-                # Сброс
                 supabase.table("links").update({"status": "pending", "is_indexed": None}).neq("id", 0).execute()
                 st.rerun()
 
-# 2. ПРОСМОТР ПРОЕКТА (СПИСОК ПАПОК)
+# 2. ПРОСМОТР ПРОЕКТА (Обзор папок)
 elif st.session_state.selected_project_id and st.session_state.selected_folder_id is None:
     curr_proj = next(p for p in projs if p['id'] == st.session_state.selected_project_id)
     st.title(f"📂 {curr_proj['name']}")
     
-    folders = supabase.table("folders").select("*").eq("project_id", curr_proj['id']).order("created_at", desc=False).execute().data
+    folders = [f for f in all_folders if f['project_id'] == curr_proj['id']]
     links_res = supabase.table("links").select("folder_id, status, is_indexed").eq("project_id", curr_proj['id']).execute()
     df_links = pd.DataFrame(links_res.data)
     
+    # Карточки папок
     if folders:
         for f in folders:
             if not df_links.empty:
@@ -328,7 +339,7 @@ elif st.session_state.selected_project_id and st.session_state.selected_folder_i
                     st.caption(f"Ссылок: {total} | В индексе: {indexed}")
                 with c2:
                     st.write("")
-                    if st.button("Открыть ➡", key=f"open_{f['id']}", use_container_width=True):
+                    if st.button("Открыть ➡", key=f"open_card_{f['id']}", use_container_width=True):
                         st.session_state.selected_folder_id = f['id']
                         st.rerun()
                 with c3:
@@ -337,6 +348,7 @@ elif st.session_state.selected_project_id and st.session_state.selected_folder_i
                         supabase.table("folders").delete().eq("id", f['id']).execute()
                         st.rerun()
     
+    # General карточка
     gen_links = df_links[df_links['folder_id'].isnull()] if not df_links.empty else pd.DataFrame()
     if not gen_links.empty:
         with st.container(border=True):
@@ -346,13 +358,13 @@ elif st.session_state.selected_project_id and st.session_state.selected_folder_i
                 st.caption(f"Ссылок: {len(gen_links)}")
             with c2:
                 st.write("")
-                if st.button("Открыть ➡", key="open_general", use_container_width=True):
+                if st.button("Открыть ➡", key="open_card_gen", use_container_width=True):
                     st.session_state.selected_folder_id = -1
                     st.rerun()
 
     st.divider()
-    with st.popover("➕ Добавить новую папку"):
-        new_f_name = st.text_input("Название папки")
+    with st.popover("➕ Добавить папку"):
+        new_f_name = st.text_input("Название")
         if st.button("Создать папку"):
             supabase.table("folders").insert({"name": new_f_name, "project_id": curr_proj['id']}).execute()
             st.rerun()
@@ -373,21 +385,17 @@ elif st.session_state.selected_folder_id is not None:
         folder_name = "Общая (Без папки)"
         folder_db_id = None
     else:
-        f_res = supabase.table("folders").select("*").eq("id", st.session_state.selected_folder_id).execute().data
-        if not f_res:
+        # Берем имя из уже загруженного списка
+        f_obj = next((f for f in all_folders if f['id'] == st.session_state.selected_folder_id), None)
+        if not f_obj:
             st.error("Папка не найдена")
             st.session_state.selected_folder_id = None
             st.rerun()
-        folder_name = f_res[0]['name']
+        folder_name = f_obj['name']
         folder_db_id = st.session_state.selected_folder_id
 
-    col_back, col_title = st.columns([1, 5])
-    with col_back:
-        if st.button("⬅ Назад к папкам"):
-            st.session_state.selected_folder_id = None
-            st.rerun()
-    with col_title:
-        st.title(f"{curr_proj['name']} / {folder_name}")
+    # Хедер (Кнопка назад удалена, так как навигация теперь в сайдбаре, но можно оставить для удобства)
+    st.title(f"{curr_proj['name']} / {folder_name}")
 
     query = supabase.table("links").select("*").eq("project_id", curr_proj['id'])
     if folder_db_id is None:
