@@ -41,6 +41,17 @@ except Exception as e:
 # -----------------------
 # Хелперы
 # -----------------------
+def send_slack_notification(message):
+    """Отправка уведомления в Slack"""
+    try:
+        # Проверяем, есть ли настройки в secrets.toml
+        if "slack" in st.secrets and "webhook_url" in st.secrets["slack"]:
+            url = st.secrets["slack"]["webhook_url"]
+            payload = {"text": message}
+            requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Slack error: {e}")
+
 def to_excel(df):
     """Конвертация DF в Excel байты"""
     output = BytesIO()
@@ -106,7 +117,7 @@ def parse_text_urls(text_input):
 # Логика проверки (Engine)
 # -----------------------
 def run_check(links_data):
-    """Запуск проверки для переданного списка словарей [{'id':..., 'url':...}]"""
+    """Запуск проверки и отправка уведомления"""
     if not links_data: return
     
     session = init_requests()
@@ -119,7 +130,7 @@ def run_check(links_data):
     payload = []
     tasks_map = {} 
     
-    # 1. Формируем Payload
+    # Подготовка
     for item in links_data:
         payload.append({
             "location_code": 2840,
@@ -128,11 +139,16 @@ def run_check(links_data):
             "keyword": build_site_query(item['url'])
         })
 
-    # 2. Обрабатываем пачками (Batching)
     BATCH_SIZE = 50
     total = len(links_data)
     processed_count = 0
     
+    # Счетчики для статистики
+    count_indexed = 0
+    count_not_indexed = 0
+    count_error = 0
+    
+    # Цикл по пачкам
     for i in range(0, total, BATCH_SIZE):
         batch_links = links_data[i : i + BATCH_SIZE]
         batch_payload = payload[i : i + BATCH_SIZE]
@@ -140,7 +156,6 @@ def run_check(links_data):
         status_text.write(f"📤 Обработка {i+1}-{min(i+BATCH_SIZE, total)} из {total}...")
         
         try:
-            # POST
             r = session.post(base_url + TASK_POST, json=batch_payload, timeout=60)
             res = r.json()
             
@@ -155,11 +170,9 @@ def run_check(links_data):
                 
                 if not batch_task_ids: continue
 
-                # Wait
                 time.sleep(2)
                 status_text.write("⏳ Анализ результатов...")
                 
-                # GET Results
                 for tid in batch_task_ids:
                     try:
                         r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
@@ -173,7 +186,11 @@ def run_check(links_data):
                             result_items = (task_res.get('result') or [{}])[0].get('items', [])
                             is_ind = match_indexed(original_link_obj['url'], result_items)
                             
-                            # UPDATE DB
+                            # Обновляем статистику
+                            if is_ind: count_indexed += 1
+                            else: count_not_indexed += 1
+                            
+                            # Пишем в базу
                             supabase.table("links").update({
                                 "status": "done",
                                 "is_indexed": is_ind,
@@ -181,10 +198,12 @@ def run_check(links_data):
                                 "task_id": tid
                             }).eq("id", link_id).execute()
                         else:
+                            count_error += 1
                             supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
                             
                     except Exception as e:
                         print(f"Err task {tid}: {e}")
+                        count_error += 1
             else:
                 st.error(f"API Error: {res.get('status_message')}")
 
@@ -194,6 +213,16 @@ def run_check(links_data):
         except Exception as e:
             st.error(f"Network error: {e}")
 
+    # === ОТПРАВКА В SLACK (Только цифры) ===
+    msg = (
+        f"✅ *Проверка завершена!*\n"
+        f"📊 Всего: {total}\n"
+        f"🟢 В индексе: {count_indexed}\n"
+        f"🔴 Не в индексе: {count_not_indexed}\n"
+        f"⚠️ Ошибок: {count_error}"
+    )
+    send_slack_notification(msg)
+    
     status_text.success("✅ Готово!")
     time.sleep(1)
     st.rerun()
@@ -395,7 +424,7 @@ if st.session_state.selected_project_id:
                 time.sleep(1)
                 st.rerun()
             else:
-                if text_input: st.warning("Не найдено корректных ссылок (должны начинаться с http/https)")
+                if text_input: st.warning("Не найдено корректных ссылок")
 
 # 2. ГЛАВНЫЙ ДАШБОРД (Обзор всех проектов)
 else:
