@@ -414,8 +414,9 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
 # ==========================================
 with st.sidebar:
     # --- LANGUAGE SWITCHER ---
-    lang_choice = st.radio("Language / Мова:", ["English", "Українська"], horizontal=True)
-    if lang_choice == "English":
+    # ДОБАВИЛ ФЛАГИ СЮДА 👇
+    lang_choice = st.radio("Language / Мова:", ["🇬🇧 English", "🇺🇦 Українська"], horizontal=True)
+    if lang_choice == "🇬🇧 English":
         st.session_state.lang = "en"
     else:
         st.session_state.lang = "uk"
