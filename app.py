@@ -44,67 +44,71 @@ except Exception as e:
 # Хелперы Slack и Excel
 # -----------------------
 def send_slack_file(file_bytes, filename, message):
-    """Отправка файла в Slack через Bot API"""
+    """Отправка файла в Slack с ВЫВОДОМ ОШИБОК"""
     try:
         if "slack" in st.secrets:
             token = st.secrets["slack"].get("bot_token")
             channel = st.secrets["slack"].get("channel_id")
             
-            if token and channel:
-                client = WebClient(token=token)
-                client.files_upload_v2(
-                    channel=channel,
-                    file=file_bytes,
-                    filename=filename,
-                    title=filename,
-                    initial_comment=message
-                )
+            if not token or not channel:
+                st.error("❌ Ошибка настройки: В secrets.toml нет bot_token или channel_id")
+                return
+
+            client = WebClient(token=token)
+            
+            # Пытаемся отправить
+            client.files_upload_v2(
+                channel=channel,
+                file=file_bytes,
+                filename=filename,
+                title=filename,
+                initial_comment=message
+            )
+            st.success("✅ Отчет успешно отправлен в Slack!")
+            
+        else:
+            st.error("❌ Ошибка: Секция [slack] не найдена в secrets.toml")
+
     except SlackApiError as e:
-        print(f"Slack Error: {e.response['error']}")
+        # ВОТ ЭТО ПОКАЖЕТ НАМ ПРИЧИНУ
+        error_code = e.response['error']
+        st.error(f"❌ Ошибка Slack API: {error_code}")
+        
+        # Подсказки по частым ошибкам
+        if error_code == 'not_in_channel':
+            st.warning("💡 Решение: Бот не добавлен в канал. Зайди в канал Slack и напиши: /invite @ИмяБота")
+        elif error_code == 'missing_scope':
+            st.warning("💡 Решение: У бота нет прав. Добавь 'files:write' и 'chat:write' в настройках Slack и ПЕРЕУСТАНОВИ приложение.")
+        elif error_code == 'channel_not_found':
+            st.warning("💡 Решение: ID канала указан неверно. Это должен быть код типа C07A12BC, а не название #general.")
+        elif error_code == 'invalid_auth':
+            st.warning("💡 Решение: Неверный токен. Скопируй 'Bot User OAuth Token' заново (начинается на xoxb-...).")
+
     except Exception as e:
-        print(f"Error sending file: {e}")
+        st.error(f"❌ Общая ошибка отправки: {e}")
 
 def generate_full_report(project_id=None):
-    """
-    Генерирует Excel. 
-    Если project_id передан - 1 лист.
-    Если project_id=None - много листов (все проекты).
-    """
     output = BytesIO()
-    
-    # Получаем список проектов
     if project_id:
         projs_res = supabase.table("projects").select("*").eq("id", project_id).execute()
     else:
         projs_res = supabase.table("projects").select("*").execute()
-        
     projects_list = projs_res.data
     
-    if not projects_list:
-        return None
+    if not projects_list: return None
 
-    # Записываем в Excel
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         has_data = False
         for p in projects_list:
-            # Берем ссылки
             links_res = supabase.table("links").select("*").eq("project_id", p['id']).execute()
             df = pd.DataFrame(links_res.data)
-            
             if not df.empty:
                 has_data = True
-                # Чистим имя листа (Excel не любит длинные названия и спецсимволы)
                 sheet_name = "".join(c for c in p['name'] if c.isalnum() or c in (' ', '_', '-'))[:30]
                 if not sheet_name: sheet_name = f"Proj_{p['id']}"
-                
-                # Пишем лист
-                df_clean = df[['url', 'status', 'is_indexed', 'last_check', 'created_at']]
-                df_clean.to_excel(writer, index=False, sheet_name=sheet_name)
-        
-        # Если вообще нет данных нигде
+                df[['url', 'status', 'is_indexed', 'last_check', 'created_at']].to_excel(writer, index=False, sheet_name=sheet_name)
         if not has_data:
             pd.DataFrame({'Info': ['Нет данных']}).to_excel(writer, sheet_name='Empty')
-
     return output.getvalue()
 
 def to_excel(df):
@@ -162,22 +166,16 @@ def parse_text_urls(text_input):
     return urls
 
 # -----------------------
-# Логика проверки (Engine)
+# Логика проверки
 # -----------------------
 def run_check(links_data, project_id=None, is_global=False):
-    """
-    project_id: ID конкретного проекта (если одиночная проверка)
-    is_global: True, если это массовая проверка всех папок
-    """
     if not links_data: return
-    
     session = init_requests()
     host = st.secrets["dataforseo"].get("host", "api.dataforseo.com").replace("https://", "")
     base_url = f"https://{host}"
     
     progress_bar = st.progress(0.0)
     status_text = st.empty()
-    
     payload = []
     tasks_map = {} 
     
@@ -192,21 +190,17 @@ def run_check(links_data, project_id=None, is_global=False):
     BATCH_SIZE = 50
     total = len(links_data)
     processed_count = 0
-    
-    # Счетчики
     count_indexed = 0
     count_not_indexed = 0
     
     for i in range(0, total, BATCH_SIZE):
         batch_links = links_data[i : i + BATCH_SIZE]
         batch_payload = payload[i : i + BATCH_SIZE]
-        
         status_text.write(f"📤 Обработка {i+1}-{min(i+BATCH_SIZE, total)} из {total}...")
         
         try:
             r = session.post(base_url + TASK_POST, json=batch_payload, timeout=60)
             res = r.json()
-            
             if res.get('status_code') == 20000:
                 batch_task_ids = []
                 for idx, task in enumerate(res.get('tasks', [])):
@@ -215,9 +209,7 @@ def run_check(links_data, project_id=None, is_global=False):
                         link_db_id = batch_links[idx]['id']
                         tasks_map[tid] = link_db_id
                         batch_task_ids.append(tid)
-                
                 if not batch_task_ids: continue
-
                 time.sleep(2)
                 status_text.write("⏳ Анализ результатов...")
                 
@@ -225,18 +217,14 @@ def run_check(links_data, project_id=None, is_global=False):
                     try:
                         r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
                         d_get = r_get.json()
-                        
                         link_id = tasks_map[tid]
                         original_link_obj = next(l for l in batch_links if l['id'] == link_id)
-                        
                         task_res = (d_get.get('tasks') or [{}])[0]
                         if task_res.get('status_code') == 20000:
                             result_items = (task_res.get('result') or [{}])[0].get('items', [])
                             is_ind = match_indexed(original_link_obj['url'], result_items)
-                            
                             if is_ind: count_indexed += 1
                             else: count_not_indexed += 1
-                            
                             supabase.table("links").update({
                                 "status": "done",
                                 "is_indexed": is_ind,
@@ -245,38 +233,29 @@ def run_check(links_data, project_id=None, is_global=False):
                             }).eq("id", link_id).execute()
                         else:
                             supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
-                            
                     except Exception as e:
                         print(f"Err task {tid}: {e}")
             else:
                 st.error(f"API Error: {res.get('status_message')}")
-
             processed_count += len(batch_links)
             progress_bar.progress(processed_count / total)
-            
         except Exception as e:
             st.error(f"Network error: {e}")
 
-    # === ГЕНЕРАЦИЯ И ОТПРАВКА ОТЧЕТА ===
+    # === ОТПРАВКА С ДИАГНОСТИКОЙ ===
     status_text.write("📊 Формирование отчета Excel...")
-    
-    # Если глобальная проверка - собираем ВСЕ проекты. Если одиночная - только этот.
     target_proj_id = None if is_global else project_id
     excel_bytes = generate_full_report(target_proj_id)
     
     if excel_bytes:
         date_str = datetime.now().strftime('%Y-%m-%d')
-        if is_global:
-            fname = f"Global_Report_{date_str}.xlsx"
-            msg = f"✅ *Глобальная проверка завершена!*\nВсего проверено: {total} ссылок."
-        else:
-            fname = f"Project_Report_{date_str}.xlsx"
-            msg = f"✅ *Проверка проекта завершена!*\nВсего: {total} | Индекс: {count_indexed} | Не индекс: {count_not_indexed}"
-            
+        fname = f"Global_Report_{date_str}.xlsx" if is_global else f"Project_Report_{date_str}.xlsx"
+        msg = f"✅ *Проверка завершена!*\nВсего проверено: {total}"
+        
+        # Вызов обновленной функции
         send_slack_file(excel_bytes, fname, msg)
-        status_text.success("✅ Готово! Отчет отправлен в Slack.")
     else:
-        status_text.warning("Не удалось сформировать отчет.")
+        st.error("Не удалось сформировать данные для Excel.")
         
     time.sleep(2)
     st.rerun()
@@ -286,13 +265,10 @@ def run_check(links_data, project_id=None, is_global=False):
 # -----------------------
 with st.sidebar:
     st.title("🗂 Меню")
-    
     if st.button("🏠 На главную (Дашборд)", use_container_width=True):
         st.session_state.selected_project_id = None
         st.rerun()
-    
     st.divider()
-    
     st.subheader("Мои Проекты")
     with st.expander("➕ Новый проект"):
         new_proj = st.text_input("Название")
@@ -312,7 +288,6 @@ with st.sidebar:
             is_active = (st.session_state.selected_project_id == p['id'])
             type_btn = "primary" if is_active else "secondary"
             label = f"📂 {p['name']}"
-            
             if st.button(label, key=f"proj_{p['id']}", use_container_width=True, type=type_btn):
                 st.session_state.selected_project_id = p['id']
                 st.rerun()
@@ -334,8 +309,6 @@ with st.sidebar:
 # -----------------------
 # ЛОГИКА ЭКРАНОВ
 # -----------------------
-
-# 1. ЭКРАН ПРОЕКТА
 if st.session_state.selected_project_id:
     current_proj = next((p for p in projects if p['id'] == st.session_state.selected_project_id), None)
     if not current_proj:
@@ -343,7 +316,6 @@ if st.session_state.selected_project_id:
         st.rerun()
         
     st.title(f"📂 {current_proj['name']}")
-    
     res = supabase.table("links").select("*").eq("project_id", st.session_state.selected_project_id).order("id", desc=False).execute()
     df = pd.DataFrame(res.data)
 
@@ -362,24 +334,16 @@ if st.session_state.selected_project_id:
             if pending > 0:
                 if st.button("🚀 Проверить очередь", type="primary"):
                     to_check = df[df['status'] == 'pending'][['id', 'url']].to_dict('records')
-                    # Одиночная проверка (1 лист)
                     run_check(to_check, project_id=st.session_state.selected_project_id, is_global=False)
             else:
                 if st.button("🔄 Перепроверить всё"):
                     supabase.table("links").update({"status": "pending", "is_indexed": None}).eq("project_id", st.session_state.selected_project_id).execute()
                     st.rerun()
-        
         st.divider()
 
         col_filter, col_export = st.columns([4, 1])
         with col_filter:
-            filter_option = st.radio(
-                "Фильтр:",
-                [f"Все ({total})", f"✅ В индексе ({indexed})", f"❌ Не в индексе ({not_indexed})", f"⏳ Ожидание/Ошибки ({pending})"],
-                horizontal=True,
-                label_visibility="collapsed"
-            )
-            
+            filter_option = st.radio("Фильтр:", [f"Все ({total})", f"✅ В индексе ({indexed})", f"❌ Не в индексе ({not_indexed})", f"⏳ Ожидание/Ошибки ({pending})"], horizontal=True, label_visibility="collapsed")
             if "✅" in filter_option: df_view = df[df['is_indexed'] == True]
             elif "❌" in filter_option: df_view = df[df['is_indexed'] == False]
             elif "⏳" in filter_option: df_view = df[df['status'].isin(['pending', 'error'])]
@@ -390,48 +354,31 @@ if st.session_state.selected_project_id:
             st.download_button("📥 Скачать отчет", excel_data, f"report_{current_proj['name']}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
         
         st.write("") 
-        selection = st.dataframe(
-            df_view[['url', 'status', 'is_indexed', 'last_check', 'created_at']], 
-            use_container_width=True,
-            on_select="rerun", 
-            selection_mode="multi-row",
-            column_config={
-                "is_indexed": st.column_config.CheckboxColumn("Index?", disabled=True),
-                "url": st.column_config.LinkColumn("URL"),
-                "last_check": st.column_config.DatetimeColumn("Дата проверки", format="D MMM YYYY, HH:mm")
-            }
-        )
+        selection = st.dataframe(df_view[['url', 'status', 'is_indexed', 'last_check', 'created_at']], use_container_width=True, on_select="rerun", selection_mode="multi-row", column_config={"is_indexed": st.column_config.CheckboxColumn("Index?", disabled=True), "url": st.column_config.LinkColumn("URL"), "last_check": st.column_config.DatetimeColumn("Дата проверки", format="D MMM YYYY, HH:mm")})
         
         if len(selection.selection.rows) > 0:
             selected_indices = selection.selection.rows
             selected_ids = df_view.iloc[selected_indices]['id'].tolist()
             count = len(selected_ids)
-            
             st.info(f"Выбрано элементов: {count}")
-            
             b_col1, b_col2 = st.columns([1, 1])
             with b_col1:
                 if st.button(f"🚀 Проверить выбранные ({count})", type="primary", use_container_width=True):
                     supabase.table("links").update({"status": "pending", "is_indexed": None}).in_("id", selected_ids).execute()
                     selected_records = df_view.iloc[selected_indices][['id', 'url']].to_dict('records')
-                    # Тут можно отправлять без отчета, или как одиночную проверку
                     run_check(selected_records, project_id=st.session_state.selected_project_id)
-
             with b_col2:
                 if st.button(f"🗑 Удалить выбранные ({count})", type="secondary", use_container_width=True):
                     supabase.table("links").delete().in_("id", selected_ids).execute()
                     st.success("Удалено!")
                     time.sleep(1)
                     st.rerun()
-
     else:
         st.info("В папке пусто.")
     
     st.write("---")
     st.caption("Добавить ссылки")
-    
     tab1, tab2 = st.tabs(["📁 Загрузить Excel", "📝 Вставить списком (Текст)"])
-    
     with tab1:
         uploaded = st.file_uploader("Файл .xlsx (ссылки в колонке B)", type=["xlsx"])
         if uploaded and st.button("💾 Сохранить Excel"):
@@ -439,14 +386,11 @@ if st.session_state.selected_project_id:
             if urls:
                 data = [{"project_id": st.session_state.selected_project_id, "url": u, "status": "pending"} for u in urls]
                 batch_size = 1000
-                bar = st.progress(0)
                 for i in range(0, len(data), batch_size):
                     supabase.table("links").insert(data[i:i+batch_size]).execute()
-                    bar.progress(min((i+batch_size)/len(data), 1.0))
                 st.success(f"Добавлено {len(urls)} ссылок")
                 time.sleep(1)
                 st.rerun()
-    
     with tab2:
         text_input = st.text_area("Вставьте ссылки (каждая с новой строки):", height=150, placeholder="https://site.com/page1\nhttps://site.com/page2")
         if st.button("💾 Сохранить список"):
@@ -462,17 +406,13 @@ if st.session_state.selected_project_id:
             else:
                 if text_input: st.warning("Не найдено корректных ссылок")
 
-# 2. ГЛАВНЫЙ ДАШБОРД
 else:
     st.title("📊 Дашборд мониторинга")
-    
     all_links_res = supabase.table("links").select("id, project_id, status, is_indexed, last_check, url").execute()
     all_links_df = pd.DataFrame(all_links_res.data)
-    
     if projects:
         stats_data = []
         global_pending_count = 0
-        
         for p in projects:
             pid = p['id']
             if not all_links_df.empty:
@@ -483,34 +423,19 @@ else:
                 last_date = pd.to_datetime(p_links['last_check']).max() if not p_links['last_check'].isna().all() else None
             else:
                 total, idx, pend, last_date = 0, 0, 0, None
-            
             global_pending_count += pend
-            
-            stats_data.append({
-                "ID": pid,
-                "Проект": p['name'],
-                "Всего ссылок": total,
-                "В индексе": idx,
-                "% Index": f"{(idx/total*100):.1f}%" if total > 0 else "0%",
-                "Очередь": pend,
-                "Последняя проверка": last_date
-            })
-            
+            stats_data.append({"ID": pid, "Проект": p['name'], "Всего ссылок": total, "В индексе": idx, "% Index": f"{(idx/total*100):.1f}%" if total > 0 else "0%", "Очередь": pend, "Последняя проверка": last_date})
         stats_df = pd.DataFrame(stats_data)
-        
         m1, m2 = st.columns([3, 1])
         m1.metric("Всего проектов", len(projects))
         m2.metric("Всего задач в очереди", global_pending_count)
-        
         if global_pending_count > 0:
             st.warning(f"Найдено {global_pending_count} ссылок ожидающих проверки во всех папках.")
             if st.button(f"🚀 ЗАПУСТИТЬ ВСЕ ({global_pending_count} шт.)", type="primary", use_container_width=True):
                 pending_all = all_links_df[all_links_df['status'] == 'pending'][['id', 'url']].to_dict('records')
-                # ГЛОБАЛЬНАЯ ПРОВЕРКА (Много листов)
                 run_check(pending_all, is_global=True)
         else:
             st.success("Все ссылки проверены! Очередь пуста.")
-            
         st.subheader("Сводная таблица")
         st.dataframe(stats_df, use_container_width=True, hide_index=True)
     else:
