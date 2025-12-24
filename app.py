@@ -81,7 +81,8 @@ TRANSLATIONS = {
         "project": "Project",
         "links_count": "Links count",
         "in_index": "In Index",
-        "in_queue": "In Queue"
+        "in_queue": "In Queue",
+        "db_error_retry": "⚠️ DB Connection failed. Retrying..."
     },
     "uk": {
         "nav_title": "Навігація",
@@ -141,7 +142,8 @@ TRANSLATIONS = {
         "project": "Проект",
         "links_count": "Кількість",
         "in_index": "В індексі",
-        "in_queue": "В черзі"
+        "in_queue": "В черзі",
+        "db_error_retry": "⚠️ З'єднання з БД втрачено. Повторна спроба..."
     }
 }
 
@@ -236,6 +238,25 @@ def parse_text_urls(text_input):
             urls.append(line)
     return urls
 
+# Функция с защитой от сбоев сети (Retry)
+def safe_fetch(table, select="*", order_col=None):
+    try:
+        query = supabase.table(table).select(select)
+        if order_col:
+            query = query.order(order_col, desc=(order_col == "created_at"))
+        return query.execute().data
+    except Exception as e:
+        # Если ошибка, ждем и пробуем еще раз
+        time.sleep(1)
+        try:
+            query = supabase.table(table).select(select)
+            if order_col:
+                query = query.order(order_col, desc=(order_col == "created_at"))
+            return query.execute().data
+        except Exception as e2:
+            st.error(f"Failed to fetch data: {e2}")
+            return []
+
 # -----------------------
 # ЛОГИКА ПРОВЕРКИ
 # -----------------------
@@ -264,7 +285,6 @@ def run_check(links_data, report_name_prefix="Report"):
         batch_links = links_data[i : i + BATCH_SIZE]
         batch_payload = payload[i : i + BATCH_SIZE]
         
-        # Localization for processing message
         msg_proc = t("processing").format(i+1, min(i+BATCH_SIZE, total), total)
         status_text.write(msg_proc)
         
@@ -320,7 +340,6 @@ def run_check(links_data, report_name_prefix="Report"):
             date_str = datetime.now().strftime('%Y-%m-%d')
             fname = f"{report_name_prefix}_{date_str}.xlsx"
             
-            # Localized Slack Message
             msg = t("report_msg").format(report_name_prefix, total)
             send_slack_file(excel_bytes, fname, msg)
     except Exception as e:
@@ -414,7 +433,6 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
 # ==========================================
 with st.sidebar:
     # --- LANGUAGE SWITCHER ---
-    # ДОБАВИЛ ФЛАГИ СЮДА 👇
     lang_choice = st.radio("Language / Мова:", ["🇬🇧 English", "🇺🇦 Українська"], horizontal=True)
     if lang_choice == "🇬🇧 English":
         st.session_state.lang = "en"
@@ -432,8 +450,9 @@ with st.sidebar:
     
     st.divider()
     
-    projs = supabase.table("projects").select("*").order("created_at", desc=True).execute().data
-    all_folders = supabase.table("folders").select("*").order("name", desc=False).execute().data
+    # === SAFE FETCHING FOR SIDEBAR (FIX FOR httpx.ReadError) ===
+    projs = safe_fetch("projects", order_col="created_at")
+    all_folders = safe_fetch("folders", order_col="name")
     
     if projs:
         st.caption(t("projects_list"))
@@ -487,8 +506,9 @@ if not st.session_state.selected_project_id:
         st.info(t("no_projs"))
     else:
         # Статистика
-        all_links_res = supabase.table("links").select("id, project_id, status, is_indexed").execute()
-        df_all = pd.DataFrame(all_links_res.data)
+        # Используем безопасную загрузку
+        all_links = safe_fetch("links", select="id, project_id, status, is_indexed")
+        df_all = pd.DataFrame(all_links)
         
         stats_data = []
         global_pending_count = 0
