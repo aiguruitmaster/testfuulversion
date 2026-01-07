@@ -52,6 +52,7 @@ Bash
 
 pip install streamlit supabase pandas openpyxl requests slack_sdk
 2. Конфігурація середовища (Secrets)
+
 Створіть файл .streamlit/secrets.toml у корені проекту та додайте ключі доступу. Структура файлу повинна точно відповідати наведеній нижче:
 
 Ini, TOML
