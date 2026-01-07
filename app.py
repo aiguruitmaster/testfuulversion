@@ -13,7 +13,7 @@ from slack_sdk.errors import SlackApiError
 # -----------------------
 # Конфигурация страницы
 # -----------------------
-st.set_page_config(page_title="SEO Index Manager", layout="wide")
+st.set_page_config(page_title="Link Checker", layout="wide")
 
 # ==========================================
 # 🌍 СИСТЕМА ПЕРЕВОДОВ (LOCALIZATION)
