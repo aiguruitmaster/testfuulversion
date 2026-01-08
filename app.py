@@ -508,23 +508,50 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
         
         if uploaded_file is not None and st.button("📤 Process File", key=f"proc_{folder_id}"):
             try:
-                # 1. Читаем файл с явным указанием движка (engine)
-                # Это решает ошибку "Excel file format cannot be determined"
-                if uploaded_file.name.endswith('.csv'):
-                    df_upload = pd.read_csv(uploaded_file)
-                elif uploaded_file.name.endswith('.xlsx'):
-                    df_upload = pd.read_excel(uploaded_file, engine='openpyxl')
-                elif uploaded_file.name.endswith('.xls'):
-                    df_upload = pd.read_excel(uploaded_file, engine='xlrd')
-                else:
-                    # На случай, если расширение не распознано, пробуем авто-детектом
-                    df_upload = pd.read_excel(uploaded_file)
+                df_upload = None
+                file_ext = uploaded_file.name.split('.')[-1].lower()
                 
-                # 2. Ищем колонку с ссылкой (Умный поиск)
+                # --- ПОПЫТКА 1: Стандартный Excel (xlsx) ---
+                try:
+                    df_upload = pd.read_excel(uploaded_file, engine='openpyxl')
+                except Exception:
+                    uploaded_file.seek(0) # Перемотка файла в начало
+                    
+                    # --- ПОПЫТКА 2: Старый Excel (xls) ---
+                    try:
+                        df_upload = pd.read_excel(uploaded_file, engine='xlrd')
+                    except Exception:
+                        uploaded_file.seek(0)
+                        
+                        # --- ПОПЫТКА 3: "Фейковый" Excel (HTML/XML внутри) ---
+                        # Это решит вашу ошибку "found b'<html xm'"
+                        try:
+                            # Пытаемся прочитать как HTML таблицу
+                            dfs = pd.read_html(uploaded_file)
+                            if dfs:
+                                df_upload = dfs[0] # Берем первую таблицу со страницы
+                        except Exception:
+                            uploaded_file.seek(0)
+                            
+                            # --- ПОПЫТКА 4: Обычный CSV ---
+                            try:
+                                df_upload = pd.read_csv(uploaded_file)
+                            except Exception:
+                                # Последний шанс: CSV с разделителем точка-с запятой
+                                uploaded_file.seek(0)
+                                try:
+                                    df_upload = pd.read_csv(uploaded_file, sep=';')
+                                except:
+                                    pass
+
+                if df_upload is None:
+                    st.error("❌ Failed to read file. It might be corrupted or in an unsupported format.")
+                    st.stop()
+
+                # --- ДАЛЕЕ ВАША ЛОГИКА ПОИСКА ССЫЛОК (Без изменений) ---
                 target_col = None
                 clean_cols = {c: str(c).lower().strip() for c in df_upload.columns}
                 
-                # Приоритет поиска
                 priority_keywords = [
                     'referring page', 'source url', 
                     'target url', 'donor', 
@@ -542,7 +569,6 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                     target_col = df_upload.columns[0]
                     st.toast(f"⚠️ Column name not recognized. Using first column: '{target_col}'", icon="ℹ️")
 
-                # 3. Извлекаем ссылки
                 urls_from_file = df_upload[target_col].dropna().astype(str).tolist()
                 valid_urls = [u.strip() for u in urls_from_file if len(u.strip()) > 5]
 
@@ -558,15 +584,14 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                     for i in range(0, len(data), batch_size):
                         supabase.table("links").insert(data[i:i+batch_size]).execute()
                         
-                    st.success(f"✅ Success! Added {len(data)} links from file.")
+                    st.success(f"✅ Success! Added {len(data)} links. Order preserved.")
                     time.sleep(1.5)
                     st.rerun()
                 else:
                     st.error("❌ No valid URLs found in the file.")
                     
             except Exception as e:
-                # Выводим подробную ошибку, если библиотеки нет
-                st.error(f"Error processing file: {e}. Try installing openpyxl: 'pip install openpyxl'")
+                st.error(f"Global Error: {e}")
 
 # ==========================================
 # САЙДБАР (ИЕРАРХИЯ)
