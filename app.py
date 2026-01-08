@@ -271,6 +271,7 @@ def run_check(links_data, report_name_prefix="Report"):
     payload = []
     tasks_map = {} 
     
+    # Подготовка данных (Payload)
     for item in links_data:
         payload.append({
             "location_code": 2840, "language_code": "en", "depth": 10,
@@ -281,6 +282,7 @@ def run_check(links_data, report_name_prefix="Report"):
     total = len(links_data)
     processed = 0
     
+    # Обработка пакетами по 50 штук
     for i in range(0, total, BATCH_SIZE):
         batch_links = links_data[i : i + BATCH_SIZE]
         batch_payload = payload[i : i + BATCH_SIZE]
@@ -289,46 +291,81 @@ def run_check(links_data, report_name_prefix="Report"):
         status_text.write(msg_proc)
         
         try:
+            # 1. ОТПРАВКА ЗАДАЧ (POST)
             r = session.post(base_url + TASK_POST, json=batch_payload, timeout=60)
             res = r.json()
+            
             if res.get('status_code') == 20000:
                 batch_ids = []
+                # Собираем ID задач
                 for idx, task in enumerate(res.get('tasks', [])):
                     if task.get('id'):
                         tid = task['id']
                         tasks_map[tid] = batch_links[idx]['id']
                         batch_ids.append(tid)
+                
                 if not batch_ids: 
                     processed += len(batch_links)
                     continue
-                time.sleep(2)
-                status_text.write(t("analyzing"))
+
+                # 2. ЦИКЛ ОЖИДАНИЯ (POLLING) - ГЛАВНОЕ ИСПРАВЛЕНИЕ
                 for tid in batch_ids:
-                    try:
-                        r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
-                        d_get = r_get.json()
-                        link_id = tasks_map[tid]
-                        url_obj = next(l for l in batch_links if l['id'] == link_id)
-                        task_res = (d_get.get('tasks') or [{}])[0]
-                        if task_res.get('status_code') == 20000:
-                            items = (task_res.get('result') or [{}])[0].get('items', [])
-                            is_ind = match_indexed(url_obj['url'], items)
-                            supabase.table("links").update({
-                                "status": "done", "is_indexed": is_ind, 
-                                "last_check": datetime.utcnow().isoformat(), "task_id": tid
-                            }).eq("id", link_id).execute()
-                        else:
-                            supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
-                    except: pass
+                    link_id = tasks_map[tid]
+                    max_retries = 10  # Пробуем 10 раз
+                    retry_delay = 3   # Ждем 3 секунды между попытками
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            # Запрашиваем результат конкретной задачи
+                            r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
+                            d_get = r_get.json()
+                            
+                            task_res = (d_get.get('tasks') or [{}])[0]
+                            status_code = task_res.get('status_code')
+
+                            # СЛУЧАЙ 1: Успешно (20000)
+                            if status_code == 20000:
+                                items = (task_res.get('result') or [{}])[0].get('items', [])
+                                url_obj = next(l for l in batch_links if l['id'] == link_id)
+                                is_ind = match_indexed(url_obj['url'], items)
+                                
+                                supabase.table("links").update({
+                                    "status": "done", 
+                                    "is_indexed": is_ind, 
+                                    "last_check": datetime.utcnow().isoformat(), 
+                                    "task_id": tid
+                                }).eq("id", link_id).execute()
+                                break # Выход из цикла повторов, идем к следующей ссылке
+
+                            # СЛУЧАЙ 2: В очереди (40602)
+                            elif status_code == 40602:
+                                status_text.write(f"⏳ Task {tid} in queue... (Attempt {attempt+1}/{max_retries})")
+                                time.sleep(retry_delay)
+                                continue # Ждем и пробуем снова
+
+                            # СЛУЧАЙ 3: Ошибка API
+                            else:
+                                supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
+                                break # Прекращаем попытки
+
+                        except Exception as e:
+                            print(f"Connection error on task {tid}: {e}")
+                            time.sleep(1)
+                    else:
+                        # Если цикл for закончился без break, значит вышло время (Timeout)
+                        supabase.table("links").update({"status": "timeout"}).eq("id", link_id).execute()
+
             else:
                 st.error(f"API Error: {res.get('status_message')}")
             
             processed += len(batch_links)
             progress_bar.progress(processed / total)
+            
         except Exception as e:
             st.error(f"Net Error: {e}")
-        time.sleep(1.5)
+            time.sleep(1.5)
 
+    # Генерация и отправка отчета (без изменений)
     status_text.write(t("sending_report"))
     try:
         checked_ids = [item['id'] for item in links_data]
