@@ -4,3 +4,4 @@ pandas
 openpyxl
 requests
 slack_sdk
+xlrd
