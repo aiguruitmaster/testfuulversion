@@ -409,21 +409,34 @@ def run_check(links_data, report_name_prefix="Report"):
 # ФУНКЦИЯ ОТРИСОВКИ ИНТЕРФЕЙСА ПАПКИ/ПРОЕКТА
 # -----------------------
 def render_link_interface(project_id, folder_id=None, folder_name=""):
-    """Рисует таблицу, кнопки и загрузку для конкретного контекста"""
+    """
+    Рисует таблицу ссылок и интерфейс добавления.
+    - Поддерживает .xlsx, .xls, .csv
+    - Сохраняет СТРОГИЙ порядок строк (как в файле)
+    - Умно ищет колонку с ссылкой (приоритет на Referring Page)
+    """
     
-    # Запрос ссылок
+    # ---------------------------------------------------------
+    # 1. ЗАГРУЗКА И ОТОБРАЖЕНИЕ (СОРТИРОВКА ПО ВОЗРАСТАНИЮ ID)
+    # ---------------------------------------------------------
     query = supabase.table("links").select("*").eq("project_id", project_id)
+    
     if folder_id is None:
         query = query.is_("folder_id", "null")
     else:
         query = query.eq("folder_id", folder_id)
     
-    links = query.order("id", desc=True).execute().data
+    # !!! ГЛАВНОЕ ИСПРАВЛЕНИЕ ПОРЯДКА !!!
+    # desc=False означает "от старых к новым". 
+    # Так первая строка из Excel останется первой в таблице.
+    links = query.order("id", desc=False).execute().data
+    
     df = pd.DataFrame(links)
 
     if df.empty:
         st.info(t("empty_folder"))
     else:
+        # Метрики
         total = len(df)
         indexed = len(df[df['is_indexed'] == True])
         pending = len(df[df['status'] == 'pending'])
@@ -445,17 +458,20 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                     st.rerun()
 
         st.write("")
+        # Таблица
         selection = st.dataframe(
             df[['url', 'status', 'is_indexed', 'last_check']],
-            width="stretch", 
+            width=None, 
+            use_container_width=True,
             on_select="rerun",
             selection_mode="multi-row",
             column_config={
                 "is_indexed": st.column_config.CheckboxColumn(t("col_index"), disabled=True),
-                "url": st.column_config.LinkColumn(t("col_url"))
+                "url": st.column_config.LinkColumn(t("col_url"), display_text=None)
             }
         )
         
+        # Удаление
         if len(selection.selection.rows) > 0:
             sel_idx = selection.selection.rows
             sel_ids = df.iloc[sel_idx]['id'].tolist()
@@ -464,25 +480,91 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                 st.rerun()
 
     st.divider()
-    st.subheader(t("add_links_title").format(folder_name))
-    text_input = st.text_area(t("paste_links"), height=100, key=f"input_{folder_id}")
-    if st.button(t("save_btn"), key=f"save_{folder_id}"):
-        urls = parse_text_urls(text_input)
-        if urls:
-            data = [{
-                "project_id": project_id,
-                "url": u,
-                "folder_id": folder_id,
-                "status": "pending"
-            } for u in urls]
-            
-            batch_size = 500
-            for i in range(0, len(data), batch_size):
-                supabase.table("links").insert(data[i:i+batch_size]).execute()
-            
-            st.success(t("success_added").format(len(urls)))
-            time.sleep(1)
-            st.rerun()
+    
+    # ---------------------------------------------------------
+    # 2. ИНТЕРФЕЙС ЗАГРУЗКИ (XLSX / CSV)
+    # ---------------------------------------------------------
+    st.subheader(f"📥 Add links to '{folder_name}'")
+    
+    tab_text, tab_file = st.tabs(["📝 Paste List", "ep Upload Excel/CSV"])
+    
+    # --- Вкладка 1: Текст ---
+    with tab_text:
+        text_input = st.text_area(t("paste_links"), height=150, key=f"input_{folder_id}")
+        if st.button(t("save_btn"), key=f"save_txt_{folder_id}"):
+            urls = parse_text_urls(text_input)
+            if urls:
+                data = [{"project_id": project_id, "url": u, "folder_id": folder_id, "status": "pending"} for u in urls]
+                batch_size = 1000
+                for i in range(0, len(data), batch_size):
+                    supabase.table("links").insert(data[i:i+batch_size]).execute()
+                st.success(t("success_added").format(len(urls)))
+                time.sleep(1)
+                st.rerun()
+
+    # --- Вкладка 2: Файл (XLSX Support) ---
+    with tab_file:
+        uploaded_file = st.file_uploader("Excel (.xlsx, .xls) or CSV", type=['xlsx', 'xls', 'csv'], key=f"file_{folder_id}")
+        
+        if uploaded_file is not None and st.button("📤 Process File", key=f"proc_{folder_id}"):
+            try:
+                # 1. Читаем файл в зависимости от формата
+                if uploaded_file.name.endswith('.csv'):
+                    df_upload = pd.read_csv(uploaded_file)
+                else:
+                    # Excel файлы (xlsx/xls) читаются тут
+                    df_upload = pd.read_excel(uploaded_file)
+                
+                # 2. Ищем колонку с ссылкой (Умный поиск)
+                target_col = None
+                clean_cols = {c: str(c).lower().strip() for c in df_upload.columns}
+                
+                # Приоритет поиска (Сначала Referring Page, потом просто URL)
+                priority_keywords = [
+                    'referring page', 'source url',  # Самые важные для SEO
+                    'target url', 'donor', 
+                    'url', 'link', 'website'
+                ]
+                
+                for kw in priority_keywords:
+                    for original_col, clean_col in clean_cols.items():
+                        if kw in clean_col:
+                            target_col = original_col
+                            break
+                    if target_col: break
+                
+                # Если не нашли по ключевым словам, берем первую колонку
+                if not target_col:
+                    target_col = df_upload.columns[0]
+                    st.toast(f"⚠️ Column name not recognized. Using first column: '{target_col}'", icon="ℹ️")
+
+                # 3. Извлекаем ссылки, сохраняя порядок
+                urls_from_file = df_upload[target_col].dropna().astype(str).tolist()
+                
+                # Фильтруем (оставляем только то, что похоже на ссылку)
+                valid_urls = [u.strip() for u in urls_from_file if len(u.strip()) > 5]
+
+                if valid_urls:
+                    data = [{
+                        "project_id": project_id, 
+                        "url": u, 
+                        "folder_id": folder_id, 
+                        "status": "pending"
+                    } for u in valid_urls]
+                    
+                    # Загружаем пакетами (чтобы не зависло на больших файлах)
+                    batch_size = 1000
+                    for i in range(0, len(data), batch_size):
+                        supabase.table("links").insert(data[i:i+batch_size]).execute()
+                        
+                    st.success(f"✅ Success! Added {len(data)} links from file. Order preserved.")
+                    time.sleep(1.5)
+                    st.rerun()
+                else:
+                    st.error("❌ No valid URLs found in the file.")
+                    
+            except Exception as e:
+                st.error(f"Error processing file: {e}")
 
 # ==========================================
 # САЙДБАР (ИЕРАРХИЯ)
