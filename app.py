@@ -271,7 +271,7 @@ def run_check(links_data, report_name_prefix="Report"):
     payload = []
     tasks_map = {} 
     
-    # Подготовка данных (Payload)
+    # Prepare payload
     for item in links_data:
         payload.append({
             "location_code": 2840, "language_code": "en", "depth": 10,
@@ -282,7 +282,6 @@ def run_check(links_data, report_name_prefix="Report"):
     total = len(links_data)
     processed = 0
     
-    # Обработка пакетами по 50 штук
     for i in range(0, total, BATCH_SIZE):
         batch_links = links_data[i : i + BATCH_SIZE]
         batch_payload = payload[i : i + BATCH_SIZE]
@@ -291,13 +290,12 @@ def run_check(links_data, report_name_prefix="Report"):
         status_text.write(msg_proc)
         
         try:
-            # 1. ОТПРАВКА ЗАДАЧ (POST)
+            # 1. POST TASKS
             r = session.post(base_url + TASK_POST, json=batch_payload, timeout=60)
             res = r.json()
             
             if res.get('status_code') == 20000:
                 batch_ids = []
-                # Собираем ID задач
                 for idx, task in enumerate(res.get('tasks', [])):
                     if task.get('id'):
                         tid = task['id']
@@ -308,22 +306,23 @@ def run_check(links_data, report_name_prefix="Report"):
                     processed += len(batch_links)
                     continue
 
-                # 2. ЦИКЛ ОЖИДАНИЯ (POLLING) - ГЛАВНОЕ ИСПРАВЛЕНИЕ
+                # 2. POLLING LOOP (THE FIX)
+                # We iterate through the tasks we just created
                 for tid in batch_ids:
                     link_id = tasks_map[tid]
-                    max_retries = 10  # Пробуем 10 раз
-                    retry_delay = 3   # Ждем 3 секунды между попытками
+                    max_retries = 10  # Try 10 times
+                    retry_delay = 3   # Wait 3 seconds between tries
                     
                     for attempt in range(max_retries):
                         try:
-                            # Запрашиваем результат конкретной задачи
+                            # Check status
                             r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
                             d_get = r_get.json()
                             
                             task_res = (d_get.get('tasks') or [{}])[0]
                             status_code = task_res.get('status_code')
 
-                            # СЛУЧАЙ 1: Успешно (20000)
+                            # CASE: Done (20000)
                             if status_code == 20000:
                                 items = (task_res.get('result') or [{}])[0].get('items', [])
                                 url_obj = next(l for l in batch_links if l['id'] == link_id)
@@ -335,24 +334,24 @@ def run_check(links_data, report_name_prefix="Report"):
                                     "last_check": datetime.utcnow().isoformat(), 
                                     "task_id": tid
                                 }).eq("id", link_id).execute()
-                                break # Выход из цикла повторов, идем к следующей ссылке
+                                break # Success! Exit the retry loop
 
-                            # СЛУЧАЙ 2: В очереди (40602)
+                            # CASE: In Queue (40602)
                             elif status_code == 40602:
                                 status_text.write(f"⏳ Task {tid} in queue... (Attempt {attempt+1}/{max_retries})")
                                 time.sleep(retry_delay)
-                                continue # Ждем и пробуем снова
+                                continue # Wait and try again
 
-                            # СЛУЧАЙ 3: Ошибка API
+                            # CASE: Actual Error
                             else:
                                 supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
-                                break # Прекращаем попытки
+                                break # Stop retrying
 
                         except Exception as e:
                             print(f"Connection error on task {tid}: {e}")
                             time.sleep(1)
                     else:
-                        # Если цикл for закончился без break, значит вышло время (Timeout)
+                        # If loop finishes without 'break', it timed out
                         supabase.table("links").update({"status": "timeout"}).eq("id", link_id).execute()
 
             else:
@@ -365,8 +364,8 @@ def run_check(links_data, report_name_prefix="Report"):
             st.error(f"Net Error: {e}")
             time.sleep(1.5)
 
-    # Генерация и отправка отчета (без изменений)
     status_text.write(t("sending_report"))
+    # ... (Rest of report generation code remains the same) ...
     try:
         checked_ids = [item['id'] for item in links_data]
         res = supabase.table("links").select("url, status, is_indexed, last_check").in_("id", checked_ids).execute()
