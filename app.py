@@ -509,46 +509,45 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
         if uploaded_file is not None and st.button("📤 Process File", key=f"proc_{folder_id}"):
             try:
                 df_upload = None
-                file_ext = uploaded_file.name.split('.')[-1].lower()
                 
-                # --- ПОПЫТКА 1: Стандартный Excel (xlsx) ---
+                # --- ЦЕПОЧКА ПОПЫТОК ЧТЕНИЯ ФАЙЛА ---
+                
+                # 1. Пробуем как современный Excel (xlsx)
                 try:
                     df_upload = pd.read_excel(uploaded_file, engine='openpyxl')
                 except Exception:
-                    uploaded_file.seek(0) # Перемотка файла в начало
+                    uploaded_file.seek(0) # Важно: отматываем файл в начало перед следующей попыткой
                     
-                    # --- ПОПЫТКА 2: Старый Excel (xls) ---
+                    # 2. Пробуем как старый Excel (xls)
                     try:
                         df_upload = pd.read_excel(uploaded_file, engine='xlrd')
                     except Exception:
                         uploaded_file.seek(0)
                         
-                        # --- ПОПЫТКА 3: "Фейковый" Excel (HTML/XML внутри) ---
-                        # Это решит вашу ошибку "found b'<html xm'"
+                        # 3. Пробуем как HTML (Это решит вашу проблему с b'<html xm')
                         try:
-                            # Пытаемся прочитать как HTML таблицу
                             dfs = pd.read_html(uploaded_file)
                             if dfs:
-                                df_upload = dfs[0] # Берем первую таблицу со страницы
+                                df_upload = dfs[0] # Берем первую таблицу, которую нашли
                         except Exception:
                             uploaded_file.seek(0)
                             
-                            # --- ПОПЫТКА 4: Обычный CSV ---
+                            # 4. Пробуем как CSV (стандартный)
                             try:
                                 df_upload = pd.read_csv(uploaded_file)
                             except Exception:
-                                # Последний шанс: CSV с разделителем точка-с запятой
                                 uploaded_file.seek(0)
+                                # 5. Пробуем как CSV с другим разделителем
                                 try:
                                     df_upload = pd.read_csv(uploaded_file, sep=';')
                                 except:
                                     pass
 
                 if df_upload is None:
-                    st.error("❌ Failed to read file. It might be corrupted or in an unsupported format.")
+                    st.error("❌ Не удалось прочитать файл. Возможно, формат поврежден или не поддерживается.")
                     st.stop()
 
-                # --- ДАЛЕЕ ВАША ЛОГИКА ПОИСКА ССЫЛОК (Без изменений) ---
+                # --- ДАЛЕЕ ПОИСК КОЛОНОК (ВАШ СТАРЫЙ КОД) ---
                 target_col = None
                 clean_cols = {c: str(c).lower().strip() for c in df_upload.columns}
                 
@@ -569,6 +568,7 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                     target_col = df_upload.columns[0]
                     st.toast(f"⚠️ Column name not recognized. Using first column: '{target_col}'", icon="ℹ️")
 
+                # Извлечение и очистка
                 urls_from_file = df_upload[target_col].dropna().astype(str).tolist()
                 valid_urls = [u.strip() for u in urls_from_file if len(u.strip()) > 5]
 
@@ -591,7 +591,7 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                     st.error("❌ No valid URLs found in the file.")
                     
             except Exception as e:
-                st.error(f"Global Error: {e}")
+                st.error(f"Global Error processing file: {e}")
 
 # ==========================================
 # САЙДБАР (ИЕРАРХИЯ)
