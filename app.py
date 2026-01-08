@@ -508,20 +508,25 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
         
         if uploaded_file is not None and st.button("📤 Process File", key=f"proc_{folder_id}"):
             try:
-                # 1. Читаем файл в зависимости от формата
+                # 1. Читаем файл с явным указанием движка (engine)
+                # Это решает ошибку "Excel file format cannot be determined"
                 if uploaded_file.name.endswith('.csv'):
                     df_upload = pd.read_csv(uploaded_file)
+                elif uploaded_file.name.endswith('.xlsx'):
+                    df_upload = pd.read_excel(uploaded_file, engine='openpyxl')
+                elif uploaded_file.name.endswith('.xls'):
+                    df_upload = pd.read_excel(uploaded_file, engine='xlrd')
                 else:
-                    # Excel файлы (xlsx/xls) читаются тут
+                    # На случай, если расширение не распознано, пробуем авто-детектом
                     df_upload = pd.read_excel(uploaded_file)
                 
                 # 2. Ищем колонку с ссылкой (Умный поиск)
                 target_col = None
                 clean_cols = {c: str(c).lower().strip() for c in df_upload.columns}
                 
-                # Приоритет поиска (Сначала Referring Page, потом просто URL)
+                # Приоритет поиска
                 priority_keywords = [
-                    'referring page', 'source url',  # Самые важные для SEO
+                    'referring page', 'source url', 
                     'target url', 'donor', 
                     'url', 'link', 'website'
                 ]
@@ -533,15 +538,12 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                             break
                     if target_col: break
                 
-                # Если не нашли по ключевым словам, берем первую колонку
                 if not target_col:
                     target_col = df_upload.columns[0]
                     st.toast(f"⚠️ Column name not recognized. Using first column: '{target_col}'", icon="ℹ️")
 
-                # 3. Извлекаем ссылки, сохраняя порядок
+                # 3. Извлекаем ссылки
                 urls_from_file = df_upload[target_col].dropna().astype(str).tolist()
-                
-                # Фильтруем (оставляем только то, что похоже на ссылку)
                 valid_urls = [u.strip() for u in urls_from_file if len(u.strip()) > 5]
 
                 if valid_urls:
@@ -552,19 +554,19 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
                         "status": "pending"
                     } for u in valid_urls]
                     
-                    # Загружаем пакетами (чтобы не зависло на больших файлах)
                     batch_size = 1000
                     for i in range(0, len(data), batch_size):
                         supabase.table("links").insert(data[i:i+batch_size]).execute()
                         
-                    st.success(f"✅ Success! Added {len(data)} links from file. Order preserved.")
+                    st.success(f"✅ Success! Added {len(data)} links from file.")
                     time.sleep(1.5)
                     st.rerun()
                 else:
                     st.error("❌ No valid URLs found in the file.")
                     
             except Exception as e:
-                st.error(f"Error processing file: {e}")
+                # Выводим подробную ошибку, если библиотеки нет
+                st.error(f"Error processing file: {e}. Try installing openpyxl: 'pip install openpyxl'")
 
 # ==========================================
 # САЙДБАР (ИЕРАРХИЯ)
