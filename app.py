@@ -261,6 +261,10 @@ def safe_fetch(table, select="*", order_col=None):
 # ЛОГИКА ПРОВЕРКИ
 # -----------------------
 def run_check(links_data, report_name_prefix="Report"):
+    """
+    Основная функция проверки ссылок через DataForSEO.
+    Исправлена логика ожидания (Polling) для статусов 40601 и 40602.
+    """
     if not links_data: return
     session = init_requests()
     host = st.secrets["dataforseo"].get("host", "api.dataforseo.com").replace("https://", "")
@@ -271,10 +275,12 @@ def run_check(links_data, report_name_prefix="Report"):
     payload = []
     tasks_map = {} 
     
-    # Prepare payload
+    # 1. Подготовка данных для всех ссылок
     for item in links_data:
         payload.append({
-            "location_code": 2840, "language_code": "en", "depth": 10,
+            "location_code": 2840, 
+            "language_code": "en", 
+            "depth": 10,
             "keyword": build_site_query(item['url'])
         })
 
@@ -282,6 +288,7 @@ def run_check(links_data, report_name_prefix="Report"):
     total = len(links_data)
     processed = 0
     
+    # 2. Обработка пакетами (Batch processing)
     for i in range(0, total, BATCH_SIZE):
         batch_links = links_data[i : i + BATCH_SIZE]
         batch_payload = payload[i : i + BATCH_SIZE]
@@ -290,12 +297,13 @@ def run_check(links_data, report_name_prefix="Report"):
         status_text.write(msg_proc)
         
         try:
-            # 1. POST TASKS
+            # --- ШАГ 1: ОТПРАВКА ЗАДАЧ (POST) ---
             r = session.post(base_url + TASK_POST, json=batch_payload, timeout=60)
             res = r.json()
             
             if res.get('status_code') == 20000:
                 batch_ids = []
+                # Сопоставляем ID задачи DataForSEO с ID нашей ссылки в базе
                 for idx, task in enumerate(res.get('tasks', [])):
                     if task.get('id'):
                         tid = task['id']
@@ -306,23 +314,22 @@ def run_check(links_data, report_name_prefix="Report"):
                     processed += len(batch_links)
                     continue
 
-                # 2. POLLING LOOP (THE FIX)
-                # We iterate through the tasks we just created
+                # --- ШАГ 2: ЦИКЛ ОЖИДАНИЯ РЕЗУЛЬТАТОВ (POLLING) ---
                 for tid in batch_ids:
                     link_id = tasks_map[tid]
-                    max_retries = 10  # Try 10 times
-                    retry_delay = 3   # Wait 3 seconds between tries
+                    max_retries = 10  # Максимум 10 попыток
+                    retry_delay = 3   # 3 секунды паузы между попытками
                     
                     for attempt in range(max_retries):
                         try:
-                            # Check status
+                            # Запрашиваем статус конкретной задачи
                             r_get = session.get(base_url + TASK_GET_ADV.format(task_id=tid), timeout=30)
                             d_get = r_get.json()
                             
                             task_res = (d_get.get('tasks') or [{}])[0]
                             status_code = task_res.get('status_code')
 
-                            # CASE: Done (20000)
+                            # СЦЕНАРИЙ А: Успешно (20000)
                             if status_code == 20000:
                                 items = (task_res.get('result') or [{}])[0].get('items', [])
                                 url_obj = next(l for l in batch_links if l['id'] == link_id)
@@ -334,38 +341,41 @@ def run_check(links_data, report_name_prefix="Report"):
                                     "last_check": datetime.utcnow().isoformat(), 
                                     "task_id": tid
                                 }).eq("id", link_id).execute()
-                                break # Success! Exit the retry loop
+                                break # Готово, выходим из цикла попыток
 
-                            # CASE: In Queue (40602)
-                            elif status_code == 40602:
-                                status_text.write(f"⏳ Task {tid} in queue... (Attempt {attempt+1}/{max_retries})")
+                            # СЦЕНАРИЙ Б: Ожидание (40602 - Queue, 40601 - Handed)
+                            elif status_code == 40602 or status_code == 40601:
+                                status_text.write(f"⏳ Processing task {tid}... Status: {status_code} (Attempt {attempt+1}/{max_retries})")
                                 time.sleep(retry_delay)
-                                continue # Wait and try again
+                                continue # Ждем и пробуем снова
 
-                            # CASE: Actual Error
+                            # СЦЕНАРИЙ В: Ошибка API
                             else:
+                                error_msg = task_res.get('status_message', 'Unknown API Error')
+                                print(f"API Error for {tid}: {error_msg}")
                                 supabase.table("links").update({"status": "error"}).eq("id", link_id).execute()
-                                break # Stop retrying
+                                break # Прекращаем попытки
 
                         except Exception as e:
-                            print(f"Connection error on task {tid}: {e}")
+                            print(f"Network error polling task {tid}: {e}")
                             time.sleep(1)
                     else:
-                        # If loop finishes without 'break', it timed out
+                        # Если цикл for завершился без break, значит вышло время (Timeout)
                         supabase.table("links").update({"status": "timeout"}).eq("id", link_id).execute()
 
             else:
+                # Ошибка на этапе POST (например, нет денег на балансе)
                 st.error(f"API Error: {res.get('status_message')}")
             
             processed += len(batch_links)
             progress_bar.progress(processed / total)
             
         except Exception as e:
-            st.error(f"Net Error: {e}")
+            st.error(f"Global Net Error: {e}")
             time.sleep(1.5)
 
+    # 3. Генерация отчета и отправка в Slack
     status_text.write(t("sending_report"))
-    # ... (Rest of report generation code remains the same) ...
     try:
         checked_ids = [item['id'] for item in links_data]
         res = supabase.table("links").select("url, status, is_indexed, last_check").in_("id", checked_ids).execute()
@@ -379,7 +389,7 @@ def run_check(links_data, report_name_prefix="Report"):
             msg = t("report_msg").format(report_name_prefix, total)
             send_slack_file(excel_bytes, fname, msg)
     except Exception as e:
-        st.error(f"Report Error: {e}")
+        st.error(f"Report Generation Error: {e}")
 
     status_text.success(t("done"))
     time.sleep(1)
