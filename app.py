@@ -428,8 +428,8 @@ def render_link_interface(project_id, folder_id=None, folder_name=""):
     
     # !!! ГЛАВНОЕ ИСПРАВЛЕНИЕ ПОРЯДКА !!!
     # desc=False означает "от старых к новым". 
-    # Так первая строка из Excel останется первой в таблице.
-    links = query.order("id", desc=False).execute().data
+    # Получаем от 0 до 50 000 записей
+    links = query.order("id", desc=False).range(0, 50000).execute().data
     
     df = pd.DataFrame(links)
 
